@@ -470,6 +470,29 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS utterance_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT,
+                scope_type TEXT,
+                scope_id TEXT,
+                actor_user_id TEXT,
+                raw_text TEXT NOT NULL,
+                predicted_domain TEXT,
+                predicted_intent TEXT,
+                predicted_tool_calls_json TEXT,
+                predicted_confidence REAL,
+                final_domain TEXT,
+                final_intent TEXT,
+                final_tool_calls_json TEXT,
+                user_feedback TEXT,
+                is_correct INTEGER,
+                source TEXT NOT NULL DEFAULT 'line',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 line_user_id TEXT,
@@ -5384,6 +5407,172 @@ def clean_charts_reply(raw_text: str, line_user_id: str | None) -> str:
     return f"\u5df2\u6e05\u7406\u8d85\u904e {get_chart_retention_days()} \u5929\u7684\u5716\u8868\u5feb\u53d6\uff0c\u522a\u9664 {deleted_count} \u5f35\u5716\u7247\u3002"
 
 
+def route_domain(route: ActionRoute) -> str:
+    if route.action in {"create_payable", "query_payables", "mark_payable_paid"}:
+        return "payable"
+    if route.action in {"query_balance", "query_available_cash", "ask_available_investment_cash"}:
+        return "finance"
+    if route.action in {"create_income", "query_incomes", "list_incomes"}:
+        return "finance"
+    if route.action in {"create_expense", "query_expenses", "list_expenses", "top_expense", "delete_expense"}:
+        return "finance"
+    if route.action in {"list_duplicates", "delete_duplicates"}:
+        return "usage"
+    return "chat"
+
+
+def route_intent(route: ActionRoute) -> str:
+    if route.action == "list_incomes":
+        return "list_incomes"
+    if route.action == "query_incomes":
+        return "query_incomes"
+    if route.action == "ask_available_investment_cash":
+        return "investment_advice"
+    return route.action
+
+
+def route_tool_calls_json(route: ActionRoute) -> str:
+    payload = {
+        "action": route.action,
+        "should_mutate_db": route.should_mutate_db,
+        "item_type": route.item_type,
+        "income_type": route.income_type,
+        "category": route.category,
+        "amount": route.amount,
+        "due_date": route.due_date,
+        "status": route.status,
+        "reason": route.reason,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def log_utterance(
+    raw_text: str,
+    message_id: str | None,
+    actor_user_id: str | None,
+    scope_type: str | None,
+    scope_id: str | None,
+    route: ActionRoute,
+) -> None:
+    predicted_domain = route_domain(route)
+    predicted_intent = route_intent(route)
+    tool_calls_json = route_tool_calls_json(route)
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO utterance_logs (
+                    message_id, scope_type, scope_id, actor_user_id, raw_text,
+                    predicted_domain, predicted_intent, predicted_tool_calls_json, predicted_confidence,
+                    final_domain, final_intent, final_tool_calls_json,
+                    user_feedback, is_correct, source, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'line', ?)
+                """,
+                (
+                    message_id,
+                    scope_type,
+                    scope_id,
+                    actor_user_id,
+                    raw_text,
+                    predicted_domain,
+                    predicted_intent,
+                    tool_calls_json,
+                    route.confidence,
+                    predicted_domain,
+                    predicted_intent,
+                    tool_calls_json,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        logger.exception("Failed to write utterance log message_id=%s text=%s", message_id, raw_text)
+
+
+def feedback_label_to_domain_intent(label: str) -> tuple[str, str]:
+    normalized = re.sub(r"\s+", "", label)
+    if any(term in normalized for term in ("\u5c45\u5bb6\u63d0\u9192", "\u9031\u671f\u63d0\u9192")):
+        return "reminder", "create"
+    if any(term in normalized for term in ("\u5c45\u5bb6\u5f85\u8fa6", "\u5bb6\u5ead\u4e8b\u9805", "\u5f85\u8fa6")):
+        return "home", "create_task"
+    if "\u6536\u5165\u67e5\u8a62" in normalized:
+        return "finance", "query_incomes"
+    if "\u623f\u5c4b\u4fee\u7e55" in normalized or "\u4fee\u7e55" in normalized:
+        return "home", "create_maintenance_record"
+    if "\u8a18\u5e33" in normalized:
+        return "finance", "create_expense"
+    return "chat", "chat"
+
+
+def apply_last_utterance_feedback(raw_text: str, actor_user_id: str | None, scope_id: str | None) -> str | None:
+    match = re.search(r"^\s*\u4e0a\u4e00\u53e5(?:\u5224\u932f\uff0c?)?(?:\u4e0d\u662f\u8a18\u5e33\uff0c?)?\s*(?:\u61c9\u8a72\u662f|是)\s*(.+?)\s*$", raw_text)
+    if not match:
+        return None
+    feedback_target = match.group(1).strip()
+    final_domain, final_intent = feedback_label_to_domain_intent(feedback_target)
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM utterance_logs
+            WHERE (? IS NULL OR scope_id = ?)
+              AND (? IS NULL OR actor_user_id = ?)
+              AND raw_text != ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (scope_id, scope_id, actor_user_id, actor_user_id, raw_text),
+        ).fetchone()
+        if not row:
+            return "\u6211\u627e\u4e0d\u5230\u53ef\u4ee5\u4fee\u6b63\u7684\u4e0a\u4e00\u53e5\u7d00\u9304\u3002"
+        conn.execute(
+            """
+            UPDATE utterance_logs
+            SET user_feedback = ?,
+                final_domain = ?,
+                final_intent = ?,
+                final_tool_calls_json = ?,
+                is_correct = 0
+            WHERE id = ?
+            """,
+            (
+                raw_text,
+                final_domain,
+                final_intent,
+                json.dumps({"feedback": feedback_target}, ensure_ascii=False, sort_keys=True),
+                row["id"],
+            ),
+        )
+        conn.commit()
+    return f"\u5df2\u8a18\u9304\u4fee\u6b63\uff1a{final_domain}.{final_intent}"
+
+
+def export_training_data(path: str = "training_intents.jsonl") -> tuple[int, str]:
+    output_path = Path(path)
+    count = 0
+    with get_db() as conn, output_path.open("w", encoding="utf-8", newline="\n") as file:
+        rows = conn.execute(
+            """
+            SELECT raw_text, predicted_domain, predicted_intent, final_domain, final_intent
+            FROM utterance_logs
+            WHERE raw_text IS NOT NULL AND TRIM(raw_text) != ''
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for row in rows:
+            domain = row["final_domain"] or row["predicted_domain"] or "chat"
+            intent = row["final_intent"] or row["predicted_intent"] or "chat"
+            file.write(json.dumps({"text": row["raw_text"], "label": f"{domain}.{intent}"}, ensure_ascii=False) + "\n")
+            count += 1
+    return count, str(output_path)
+
+
+def export_training_data_reply() -> str:
+    count, path = export_training_data()
+    return f"\u5df2\u532f\u51fa\u8a13\u7df4\u8cc7\u6599\uff1a{path}\n\u7b46\u6578\uff1a{count}"
+
+
 def handle_special_command(raw_text: str, line_user_id: str | None) -> str | None:
     normalized = re.sub(r"\s+", "", raw_text)
     if raw_text.strip().lower() in {"readsetting"} or normalized == "\u8b80\u8a2d\u5b9a":
@@ -5392,6 +5581,8 @@ def handle_special_command(raw_text: str, line_user_id: str | None) -> str | Non
         return write_setting_help_reply()
     if raw_text.strip().lower().startswith("usage") or normalized == "\u7528\u91cf":
         return usage_reply(raw_text)
+    if raw_text.strip().lower() == "exporttrainingdata":
+        return export_training_data_reply()
     if raw_text.strip().lower().startswith("cleancharts") or normalized in {"\u6e05\u7406\u5716\u8868", "\u6e05\u7a7a\u5716\u8868", "\u78ba\u8a8d\u6e05\u7a7a\u5716\u8868"}:
         return clean_charts_reply(raw_text, line_user_id)
     confirm = parse_confirm_setting_command(raw_text)
@@ -6100,13 +6291,20 @@ def process_message_sync(ctx: ProcessingContext, event: dict) -> object:
     source = event.get("source", {})
     line_user_id = source.get("userId")
     message_id = message.get("id")
+    scope_type = source.get("type")
+    scope_id = get_line_chat_id(source)
     ctx.status = "\u5206\u6790\u8a0a\u606f\u4e2d"
+    feedback_reply = apply_last_utterance_feedback(raw_text, line_user_id, scope_id)
+    if feedback_reply is not None:
+        ctx.status = "\u5b8c\u6210"
+        return feedback_reply
     special_reply = handle_special_command(raw_text, line_user_id)
     if special_reply is not None:
         ctx.status = "\u5b8c\u6210"
         return special_reply
     ctx.status = "\u7b49\u5f85 ChatGPT \u56de\u61c9\u4e2d"
     route = route_action(raw_text, line_user_id)
+    log_utterance(raw_text, message_id, line_user_id, scope_type, scope_id, route)
     if route.action in {"query_expenses", "list_expenses", "top_expense", "query_payables", "query_incomes", "list_incomes"}:
         ctx.status = "\u67e5\u8a62\u8cc7\u6599\u5eab\u4e2d"
     elif route.action in {"query_balance", "query_available_cash", "ask_available_investment_cash"}:

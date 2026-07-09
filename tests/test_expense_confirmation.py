@@ -363,6 +363,68 @@ def test_clean_charts_all_requires_confirmation(monkeypatch, tmp_path):
     assert not chart_file.exists()
 
 
+def test_process_message_logs_utterance_after_route(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="query_incomes", should_mutate_db=False, confidence=0.91, reason="test route"),
+    )
+    ctx = main.ProcessingContext(
+        actor_user_id="U1",
+        chat_id="U1",
+        reply_token="reply-token",
+        source_type="user",
+        raw_text="\u6536\u5165\u6e05\u55ae",
+        status="",
+        started_at=main.datetime.now(main.timezone.utc),
+    )
+
+    main.process_message_sync(ctx, make_line_text_event(text="\u6536\u5165\u6e05\u55ae", user_id="U1", message_id="msg-log"))
+
+    with main.get_db() as conn:
+        row = conn.execute("SELECT * FROM utterance_logs WHERE message_id = ?", ("msg-log",)).fetchone()
+    assert row is not None
+    assert row["raw_text"] == "\u6536\u5165\u6e05\u55ae"
+    assert row["actor_user_id"] == "U1"
+    assert row["scope_id"] == "U1"
+    assert row["predicted_domain"] == "finance"
+    assert row["predicted_intent"] == "list_incomes"
+    assert row["final_intent"] == "list_incomes"
+
+
+def test_feedback_updates_last_utterance_log(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    route = main.ActionRoute(action="create_expense", should_mutate_db=True, confidence=0.8, reason="test")
+    main.log_utterance("\u63d0\u9192\u6211\u4e0b\u9031\u516d\u6e05\u51b7\u6c23\u6ffe\u7db2", "m1", "U1", "user", "U1", route)
+
+    reply = main.apply_last_utterance_feedback("\u4e0a\u4e00\u53e5\u5224\u932f\uff0c\u61c9\u8a72\u662f \u5c45\u5bb6\u63d0\u9192", "U1", "U1")
+
+    assert "\u5df2\u8a18\u9304\u4fee\u6b63" in reply
+    with main.get_db() as conn:
+        row = conn.execute("SELECT final_domain, final_intent, is_correct, user_feedback FROM utterance_logs WHERE message_id = ?", ("m1",)).fetchone()
+    assert row["final_domain"] == "reminder"
+    assert row["final_intent"] == "create"
+    assert row["is_correct"] == 0
+    assert "\u5c45\u5bb6\u63d0\u9192" in row["user_feedback"]
+
+
+def test_export_training_data_writes_jsonl(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    route = main.ActionRoute(action="create_expense", should_mutate_db=True, confidence=0.95)
+    main.log_utterance("\u5348\u9910 120", "m1", "U1", "user", "U1", route)
+    main.apply_last_utterance_feedback("\u4e0a\u4e00\u53e5\u61c9\u8a72\u662f \u623f\u5c4b\u4fee\u7e55", "U1", "U1")
+    output_path = tmp_path / "training_intents.jsonl"
+
+    count, path = main.export_training_data(str(output_path))
+
+    assert count == 1
+    assert path == str(output_path)
+    line = output_path.read_text(encoding="utf-8").strip()
+    assert '"text": "\u5348\u9910 120"' in line
+    assert '"label": "home.create_maintenance_record"' in line
+
+
 def test_large_planning_expense_requires_confirmation(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
     monkeypatch.setattr(main, "parse_expense_text", fake_expense_parser)

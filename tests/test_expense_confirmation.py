@@ -406,6 +406,78 @@ def test_overdraft_question_routes_to_balance(monkeypatch, tmp_path):
     assert route.action == "query_balance"
 
 
+def test_income_aggregate_query_routes_to_query_incomes(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+
+    def fail_openai(text):
+        raise AssertionError("deterministic income query should run before OpenAI")
+
+    monkeypatch.setattr(main, "route_action_with_openai", fail_openai)
+
+    route = main.route_action("\u85aa\u8cc7\u6536\u5165\u662f\u591a\u5c11", "U1")
+
+    assert route.action == "query_incomes"
+    assert route.action != "query_balance"
+    assert route.income_type == "\u85aa\u8cc7\u6536\u5165"
+
+
+def test_salary_income_list_routes_to_list_incomes(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+
+    def fail_openai(text):
+        raise AssertionError("deterministic income list query should run before OpenAI")
+
+    monkeypatch.setattr(main, "route_action_with_openai", fail_openai)
+
+    route = main.route_action("\u85aa\u8cc7\u6536\u5165\u6e05\u55ae", "U1")
+
+    assert route.action == "list_incomes"
+    assert route.action != "query_balance"
+    assert route.income_type == "\u85aa\u8cc7\u6536\u5165"
+
+
+def test_income_list_routes_to_list_incomes(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+
+    def fail_openai(text):
+        raise AssertionError("deterministic income list query should run before OpenAI")
+
+    monkeypatch.setattr(main, "route_action_with_openai", fail_openai)
+
+    route = main.route_action("\u6536\u5165\u6e05\u55ae", "U1")
+
+    assert route.action == "list_incomes"
+    assert route.action != "query_balance"
+    assert route.income_type is None
+
+
+def test_this_month_income_total_routes_to_query_incomes(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+
+    def fail_openai(text):
+        raise AssertionError("deterministic income query should run before OpenAI")
+
+    monkeypatch.setattr(main, "route_action_with_openai", fail_openai)
+
+    route = main.route_action("\u9019\u500b\u6708\u6536\u5165\u662f\u591a\u5c11", "U1")
+
+    assert route.action == "query_incomes"
+    assert route.action != "query_balance"
+
+
+def test_income_balance_phrases_still_route_to_query_balance(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="query_expenses", should_mutate_db=False, confidence=0.9),
+    )
+
+    assert main.route_action("\u9019\u500b\u6708\u6536\u652f\u662f\u591a\u5c11", "U1").action == "query_balance"
+    assert main.route_action("\u9019\u500b\u6708\u662f\u5426\u900f\u652f", "U1").action == "query_balance"
+    assert main.route_action("\u9019\u500b\u6708\u9084\u5269\u591a\u5c11\u9322", "U1").action == "query_balance"
+
+
 def test_small_lunch_expense_saves_directly(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
     monkeypatch.setattr(main, "parse_expense_text", fake_expense_parser)

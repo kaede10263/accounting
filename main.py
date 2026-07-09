@@ -60,6 +60,8 @@ Action = Literal[
     "query_payables",
     "mark_payable_paid",
     "create_income",
+    "query_incomes",
+    "list_incomes",
     "query_balance",
     "query_available_cash",
     "ask_available_investment_cash",
@@ -251,6 +253,7 @@ class ActionRoute(BaseModel):
     due_date: str | None = None
     date_text: str | None = None
     category: str | None = None
+    income_type: str | None = None
     status: str | None = None
     purchase_purpose: str | None = None
 
@@ -1017,7 +1020,7 @@ def agent_plan_to_action_route(plan: AgentPlan, raw_text: str) -> ActionRoute:
         else:
             action = "query_expenses"
     elif plan.target == "incomes":
-        action = "query_balance"
+        action = "list_incomes" if plan.aggregation == "list" else "query_incomes"
     else:
         action = "chat"
 
@@ -1030,6 +1033,7 @@ def agent_plan_to_action_route(plan: AgentPlan, raw_text: str) -> ActionRoute:
         amount=plan.amount,
         due_date=plan.end_date or plan.start_date,
         category=plan.category,
+        income_type=plan.category or plan.note or plan.merchant,
         status="unpaid" if plan.target == "payables" else None,
         purchase_purpose=plan.note,
     )
@@ -1180,6 +1184,24 @@ def route_action(text: str, line_user_id: str | None) -> ActionRoute:
             reason="deterministic payable question",
             item_type=payable_type,
             status="all" if payable_type else "unpaid",
+        )
+
+    if is_income_list_query(text):
+        return ActionRoute(
+            action="list_incomes",
+            should_mutate_db=False,
+            confidence=0.95,
+            reason="deterministic income list query",
+            income_type=get_income_type(text),
+        )
+
+    if is_income_query(text):
+        return ActionRoute(
+            action="query_incomes",
+            should_mutate_db=False,
+            confidence=0.95,
+            reason="deterministic income aggregate query",
+            income_type=get_income_type(text),
         )
 
     try:
@@ -1503,9 +1525,10 @@ def parse_due_date(text: str) -> str | None:
 
 
 def is_balance_query(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text)
     keywords = (
-        "\u6536\u5165",
         "\u6536\u652f",
+        "\u6536\u5165\u652f\u51fa",
         "\u76c8\u9918",
         "\u7d50\u9918",
         "\u4e0d\u8db3",
@@ -1515,8 +1538,11 @@ def is_balance_query(text: str) -> bool:
         "\u900f\u652f",
         "\u8d85\u652f",
         "\u8d64\u5b57",
+        "\u5269\u591a\u5c11",
+        "\u9084\u6709\u591a\u5c11\u9322",
+        "\u53ef\u52d5\u7528\u591a\u5c11",
     )
-    return any(keyword in text for keyword in keywords)
+    return any(keyword in normalized for keyword in keywords)
 
 
 def is_available_investment_cash_query(text: str) -> bool:
@@ -1545,10 +1571,6 @@ def is_available_purchase_cash_query(text: str) -> bool:
         r"\u9084\u5269\u591a\u5c11\u53ef\u4ee5\u8cb7.+",
         r"\u9019\u500b\u6708\u53ef\u4ee5\u8cb7.+(?:\u55ce|\?)?",
         r"\u53ef\u4ee5\u8cb7.+(?:\u55ce|\?)?",
-        r"\u6211\u9084\u53ef\u4ee5\u82b1\u591a\u5c11",
-        r"\u9084\u53ef\u4ee5\u82b1\u591a\u5c11",
-        r"\u9019\u500b\u6708\u5269\u591a\u5c11",
-        r"\u5269\u591a\u5c11(?:\u9322)?$",
         r"\u53ef\u4ee5\u6295\u8cc7\u591a\u5c11",
     )
     return any(re.search(pattern, normalized) for pattern in patterns)
@@ -1610,11 +1632,35 @@ def resolve_income_item_name(text: str, income_type: str) -> str:
     return income_type
 
 
+def parse_month_number_from_text(text: str) -> int | None:
+    digit_match = re.search(r"(\d{1,2})\s*\u6708", text)
+    if digit_match:
+        month = int(digit_match.group(1))
+        return month if 1 <= month <= 12 else None
+    chinese_months = {
+        "\u4e00": 1,
+        "\u4e8c": 2,
+        "\u4e09": 3,
+        "\u56db": 4,
+        "\u4e94": 5,
+        "\u516d": 6,
+        "\u4e03": 7,
+        "\u516b": 8,
+        "\u4e5d": 9,
+        "\u5341": 10,
+        "\u5341\u4e00": 11,
+        "\u5341\u4e8c": 12,
+    }
+    for label, month in sorted(chinese_months.items(), key=lambda item: len(item[0]), reverse=True):
+        if f"{label}\u6708" in text:
+            return month
+    return None
+
+
 def get_month_range(text: str) -> tuple[date, date]:
     today = date.today()
-    month_match = re.search(r"(\d{1,2})\s*\u6708", text)
-    if month_match:
-        month = int(month_match.group(1))
+    month = parse_month_number_from_text(text)
+    if month:
         start_date = date(today.year, month, 1)
     else:
         start_date = today.replace(day=1)
@@ -1767,6 +1813,34 @@ def get_income_type(text: str) -> str | None:
                 return "政府補助"
             return keyword
     return None
+
+
+def get_income_type(text: str) -> str | None:
+    keywords = ("\u85aa\u8cc7\u6536\u5165", "\u85aa\u6c34", "\u85aa\u8cc7", "\u696d\u5916\u6536\u5165", "\u653f\u5e9c\u88dc\u52a9", "\u88dc\u52a9")
+    for keyword in keywords:
+        if keyword in text:
+            if keyword in {"\u85aa\u6c34", "\u85aa\u8cc7"}:
+                return "\u85aa\u8cc7\u6536\u5165"
+            if keyword == "\u88dc\u52a9":
+                return "\u653f\u5e9c\u88dc\u52a9"
+            return keyword
+    return None
+
+
+def is_income_query(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text)
+    income_terms = ("\u6536\u5165", "\u85aa\u6c34", "\u85aa\u8cc7", "\u85aa\u8cc7\u6536\u5165", "\u696d\u5916\u6536\u5165", "\u653f\u5e9c\u88dc\u52a9")
+    balance_terms = ("\u6536\u652f", "\u7d50\u9918", "\u76c8\u9918", "\u900f\u652f", "\u8d85\u652f", "\u5269\u591a\u5c11", "\u9084\u6709\u591a\u5c11\u9322", "\u53ef\u52d5\u7528", "\u5920\u4e0d\u5920", "\u4e0d\u8db3")
+    if not any(term in normalized for term in income_terms):
+        return False
+    if any(term in normalized for term in balance_terms):
+        return False
+    return True
+
+
+def is_income_list_query(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text)
+    return is_income_query(text) and any(term in normalized for term in ("\u6e05\u55ae", "\u660e\u7d30", "\u5217\u51fa", "\u6709\u54ea\u4e9b"))
 
 
 def is_paid_text(text: str) -> bool:
@@ -5403,6 +5477,92 @@ def create_multiline_expense_reply(raw_text: str, line_user_id: str | None, mess
 
 
 
+def income_type_aliases(income_type: str | None) -> list[str]:
+    if not income_type:
+        return []
+    normalized = get_income_type(income_type) or income_type
+    if normalized == "\u85aa\u8cc7\u6536\u5165":
+        return ["\u85aa\u8cc7\u6536\u5165", "\u85aa\u6c34", "\u85aa\u8cc7"]
+    if normalized == "\u653f\u5e9c\u88dc\u52a9":
+        return ["\u653f\u5e9c\u88dc\u52a9", "\u88dc\u52a9"]
+    return [normalized]
+
+
+def build_income_where_clause(
+    text: str,
+    line_user_id: str | None,
+    income_type: str | None,
+) -> tuple[str, list[object], date, date, str | None]:
+    start_date, end_date = get_month_range(text)
+    aliases = income_type_aliases(income_type or get_income_type(text))
+    where_parts = [
+        "income_date BETWEEN ? AND ?",
+        "amount > 0",
+        "(? IS NULL OR line_user_id = ? OR line_user_id IS NULL)",
+    ]
+    params: list[object] = [start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id]
+    if aliases:
+        placeholders = ", ".join("?" for _ in aliases)
+        where_parts.append(
+            f"(income_type IN ({placeholders}) OR item_name IN ({placeholders}) OR category IN ({placeholders}) OR raw_text LIKE ?)"
+        )
+        params.extend(aliases)
+        params.extend(aliases)
+        params.extend(aliases)
+        params.append(f"%{aliases[0]}%")
+    resolved_type = aliases[0] if aliases else None
+    return " AND ".join(where_parts), params, start_date, end_date, resolved_type
+
+
+def build_income_query_reply(text: str, line_user_id: str | None, income_type: str | None = None) -> str:
+    where_sql, params, start_date, _end_date, resolved_type = build_income_where_clause(text, line_user_id, income_type)
+    with get_db() as conn:
+        row = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+            FROM incomes
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+    month_label = f"{start_date.month}\u6708"
+    title_type = resolved_type or "\u6536\u5165"
+    return (
+        f"{month_label}{title_type}\n"
+        f"\u7e3d\u6536\u5165\uff1aTWD {int(row['total'] if row else 0)}\n"
+        f"\u7b46\u6578\uff1a{int(row['count'] if row else 0)}"
+    )
+
+
+def build_income_list_reply(text: str, line_user_id: str | None, income_type: str | None = None) -> str:
+    where_sql, params, start_date, _end_date, resolved_type = build_income_where_clause(text, line_user_id, income_type)
+    with get_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT income_date, amount, currency, income_type, item_name, owner, note
+            FROM incomes
+            WHERE {where_sql}
+            ORDER BY income_date ASC, id ASC
+            """,
+            params,
+        ).fetchall()
+
+    total = sum(int(row["amount"]) for row in rows)
+    month_label = f"{start_date.month}\u6708"
+    title_type = resolved_type or "\u6536\u5165"
+    lines = [f"{month_label}{title_type}\u6e05\u55ae"]
+    if rows:
+        for row in rows:
+            label = row["item_name"] or row["income_type"]
+            owner_text = f" {row['owner']}" if row["owner"] else ""
+            note_text = f" {row['note']}" if row["note"] and row["note"] != label else ""
+            lines.append(f"{row['income_date']} {label}{owner_text} {row['currency']} {int(row['amount'])}{note_text}")
+    else:
+        lines.append("\u76ee\u524d\u6c92\u6709\u6536\u5165\u8a18\u9304\u3002")
+    lines.append(f"\u5c0f\u8a08\uff1aTWD {total}\uff0c{len(rows)} \u7b46")
+    return "\n".join(lines)
+
+
 def get_month_finance(raw_text: str, line_user_id: str | None) -> dict[str, object]:
     start_date, end_date = get_month_range(raw_text)
     with get_db() as conn:
@@ -5861,6 +6021,12 @@ def execute_action_route(
     if route.action == "query_available_cash":
         return build_available_cash_reply(raw_text, line_user_id, route)
 
+    if route.action == "query_incomes":
+        return build_income_query_reply(raw_text, line_user_id, route.income_type)
+
+    if route.action == "list_incomes":
+        return build_income_list_reply(raw_text, line_user_id, route.income_type)
+
     if route.action == "query_balance":
         return build_balance_reply(raw_text, line_user_id)
 
@@ -5941,7 +6107,7 @@ def process_message_sync(ctx: ProcessingContext, event: dict) -> object:
         return special_reply
     ctx.status = "\u7b49\u5f85 ChatGPT \u56de\u61c9\u4e2d"
     route = route_action(raw_text, line_user_id)
-    if route.action in {"query_expenses", "list_expenses", "top_expense", "query_payables"}:
+    if route.action in {"query_expenses", "list_expenses", "top_expense", "query_payables", "query_incomes", "list_incomes"}:
         ctx.status = "\u67e5\u8a62\u8cc7\u6599\u5eab\u4e2d"
     elif route.action in {"query_balance", "query_available_cash", "ask_available_investment_cash"}:
         ctx.status = "\u8a08\u7b97\u6536\u652f\u4e2d"

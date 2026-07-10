@@ -122,6 +122,10 @@ curl http://localhost:8000/health
 ngrok http 8000
 ```
 
+```
+ngrok http --url=sixth-impulse-spiffy.ngrok-free.dev 8000
+```
+
 將 LINE Developers 的 Webhook URL 設為：
 
 ```text

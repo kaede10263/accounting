@@ -1,7 +1,11 @@
 import os
 import asyncio
+import json
 import sys
 import types
+
+import httpx
+from fastapi.testclient import TestClient
 
 import main
 
@@ -18,7 +22,12 @@ def setup_tmp_db(monkeypatch, tmp_path):
     main.in_flight_tasks.clear()
     main.pending_setting_changes_by_user.clear()
     main.pending_chart_cleanup_by_user.clear()
+    main.recent_line_event_times.clear()
     main.init_db()
+    with main.get_db() as conn:
+        conn.execute("DELETE FROM line_event_receipts")
+        conn.execute("DELETE FROM sql_change_logs")
+        conn.commit()
 
 
 def disable_payable_openai(monkeypatch):
@@ -74,6 +83,21 @@ def make_line_text_event(
         "source": source,
         "message": {"type": "text", "id": message_id, "text": text},
     }
+
+
+def make_httpx_status_error(
+    status_code=400,
+    body='{"message":"Invalid reply token"}',
+    url=main.LINE_REPLY_URL,
+):
+    request = httpx.Request("POST", url)
+    response = httpx.Response(
+        status_code,
+        request=request,
+        text=body,
+        headers={"x-line-request-id": "test-request-id"},
+    )
+    return httpx.HTTPStatusError("LINE API error", request=request, response=response)
 
 
 def test_watchdog_fast_process_replies_final_only(monkeypatch, tmp_path):
@@ -136,6 +160,54 @@ def test_line_chat_id_resolves_user_group_room():
     assert main.get_line_chat_id({"type": "user", "userId": "U1"}) == "U1"
     assert main.get_line_chat_id({"type": "group", "userId": "U1", "groupId": "G1"}) == "G1"
     assert main.get_line_chat_id({"type": "room", "userId": "U1", "roomId": "R1"}) == "R1"
+
+
+def test_handle_text_event_falls_back_to_push_when_reply_token_invalid(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    replies = []
+    pushes = []
+
+    async def fake_process(ctx, event):
+        raise RuntimeError("boom")
+
+    async def fake_reply(reply_token, messages):
+        replies.append((reply_token, messages))
+        raise make_httpx_status_error()
+
+    async def fake_push(chat_id, messages):
+        pushes.append((chat_id, messages))
+
+    monkeypatch.setattr(main, "process_message_with_context", fake_process)
+    monkeypatch.setattr(main, "reply_line_messages", fake_reply)
+    monkeypatch.setattr(main, "push_line_messages", fake_push)
+
+    asyncio.run(main.handle_text_event(make_line_text_event()))
+
+    expected = [{"type": "text", "text": "剛剛處理失敗了，我有記錄錯誤，請稍後再試。"}]
+    assert replies == [("reply-token", expected)]
+    assert pushes == [("U1", expected)]
+
+
+def test_line_webhook_skips_duplicate_redelivery(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event["message"]["id"])
+
+    monkeypatch.setattr(main, "verify_line_signature", lambda body, signature: True)
+    monkeypatch.setattr(main, "handle_text_event", fake_handle)
+
+    payload = {"events": [dict(make_line_text_event(message_id="m-dup"), webhookEventId="evt-dup")]}
+    client = TestClient(main.app)
+
+    first = client.post("/line/webhook", content=json.dumps(payload), headers={"X-Line-Signature": "ok"})
+    main.recent_line_event_times.clear()
+    second = client.post("/line/webhook", content=json.dumps(payload), headers={"X-Line-Signature": "ok"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert handled == ["m-dup"]
 
 
 def test_watchdog_group_final_push_uses_group_id(monkeypatch, tmp_path):
@@ -268,6 +340,20 @@ def test_write_setting_lists_editable_items(monkeypatch, tmp_path):
     assert "PUBLIC_BASE_URL" in reply
 
 
+def test_commands_help_lists_available_commands(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+
+    reply = main.handle_special_command("commands", "U1")
+
+    assert "可用指令" in reply
+    assert "commands" in reply
+    assert "checkSql" in reply
+    assert "readSetting" in reply
+    assert "writeSetting" in reply
+    assert "usage" in reply
+    assert "補充" not in reply
+
+
 def test_setting_openai_model_requires_confirmation(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
     monkeypatch.setenv("OPENAI_MODEL", "gpt-4.1")
@@ -328,6 +414,31 @@ def test_usage_command_shows_local_stats(monkeypatch, tmp_path):
     assert "ngrok" in reply
     assert "\u5716\u8868\u5feb\u53d6" in reply
     assert "\u5716\u7247\u6578\u91cf\uff1a1" in reply
+
+
+def test_recent_sql_changes_command_lists_today_insert_and_delete(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=50,
+        currency="TWD",
+        category="餐飲",
+        merchant=None,
+        note="早餐",
+        confidence=0.9,
+    )
+    expense_id = main.save_expense(expense, "早餐50", "U1", "m-sql-log")
+    main.delete_expense(f"刪除代號 {expense_id}", "U1")
+
+    reply = main.handle_special_command("checkSql", "U1")
+
+    assert reply.startswith("最近5筆 SQL 新增/刪除")
+    assert "2026/07/10 " in reply
+    assert "記帳 新增" in reply
+    assert "記帳 刪除" in reply
+    assert "#"+str(expense_id) in reply
+    assert "早餐50" in reply
 
 
 def test_clean_charts_command_removes_old_charts(monkeypatch, tmp_path):
@@ -630,11 +741,32 @@ def test_confirm_delete_expense_takes_priority_over_duplicate_action(monkeypatch
     main.pending_delete_by_user["U1"] = expense_id
 
     wrong_route = main.ActionRoute(action="delete_duplicates", should_mutate_db=False, confidence=0.9)
-    reply = main.execute_action_route(wrong_route, "確認刪除", "U1", "m2")
+    reply = main.execute_action_route(wrong_route, "88", "U1", "m2")
 
     assert count_expenses() == 0
     assert "U1" not in main.pending_delete_by_user
     assert "重複資料" not in reply
+
+
+def test_delete_expense_by_keyword_returns_candidate_instead_of_crashing(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=50,
+        currency="TWD",
+        category="餐飲",
+        merchant=None,
+        note="早餐",
+        confidence=0.9,
+    )
+    expense_id = main.save_expense(expense, "早餐50", "U1", "m-breakfast")
+
+    result = main.delete_expense("移除早餐", "U1")
+
+    assert result.deleted is False
+    assert main.pending_delete_by_user["U1"] == expense_id
+    assert "88" in (result.reason or "")
 
 
 def test_purchase_cash_for_toys_is_not_investment_reply(monkeypatch, tmp_path):
@@ -1384,6 +1516,42 @@ def test_month_finance_counts_paid_payables_as_actual_spending(monkeypatch, tmp_
     assert finance["expense_total"] == 182
     assert finance["unpaid_total"] == 10
     assert finance["available_cash"] == -192
+
+
+def test_household_expense_queries_include_other_family_members(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    set_fake_today(monkeypatch, 2026, 7, 10)
+
+    own_expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=100,
+        currency="TWD",
+        category="交通",
+        merchant=None,
+        note="加油",
+        confidence=0.9,
+    )
+    family_expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=984,
+        currency="TWD",
+        category="交通",
+        merchant=None,
+        note="加油",
+        confidence=0.9,
+    )
+    main.save_expense(own_expense, "加油100", "U1", "m-u1")
+    main.save_expense(family_expense, "加油984", "U2", "m-u2")
+
+    summary_reply = main.build_summary_reply("這星期在交通的花費總共是多少?", "U1")
+    list_reply = main.build_list_reply("這兩天的花費清單", "U1")
+
+    assert "筆數：2" in summary_reply
+    assert "總花費：TWD 1084" in summary_reply
+    assert "TWD 984" in list_reply
+    assert "TWD 100" in list_reply
 
 
 def test_july_category_ratio_short_text(monkeypatch, tmp_path):

@@ -47,6 +47,8 @@ class ProcessingContext:
 in_flight_tasks: dict[str, dict[str, object]] = {}
 pending_setting_changes_by_user: dict[str, dict[str, str]] = {}
 pending_chart_cleanup_by_user: set[str] = set()
+recent_line_event_times: dict[str, datetime] = {}
+LINE_EVENT_DEDUP_WINDOW_SECONDS = 600
 
 Currency = Literal["TWD", "USD", "JPY", "CNY", "EUR", "OTHER"]
 Intent = Literal["create", "update", "delete", "summary", "list", "chat"]
@@ -310,11 +312,51 @@ def get_ssl_verify() -> ssl.SSLContext | str | bool:
         return certifi.where()
 
 
+def summarize_httpx_response(response: httpx.Response | None) -> str:
+    if response is None:
+        return ""
+    try:
+        text = response.text.strip()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text)[:500]
+
+
+def log_line_api_http_error(api_name: str, exc: httpx.HTTPStatusError) -> None:
+    response = exc.response
+    request_id = response.headers.get("x-line-request-id", "")
+    response_text = summarize_httpx_response(response)
+    logger.error(
+        "LINE %s failed: status=%s request_id=%s body=%s",
+        api_name,
+        response.status_code,
+        request_id or "-",
+        response_text or "-",
+    )
+
+
+def is_invalid_line_reply_error(exc: httpx.HTTPStatusError) -> bool:
+    response_text = summarize_httpx_response(exc.response).lower()
+    return exc.response.status_code == 400 and (
+        "reply token" in response_text
+        or "replytoken" in response_text
+        or "invalid reply" in response_text
+    )
+
+
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(get_db_path(), timeout=30)
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def get_household_read_scope_line_user_id(_: str | None) -> str | None:
+    # This bot is used as a household ledger, so read queries should aggregate
+    # entries across family members instead of filtering to the current sender.
+    return None
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -444,6 +486,34 @@ def log_usage(
         logger.exception("Failed to write usage log provider=%s event_type=%s", provider, event_type)
 
 
+def log_sql_change(
+    entity_type: str,
+    action: str,
+    row_id: int | None,
+    summary: str,
+    line_user_id: str | None = None,
+) -> None:
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO sql_change_logs (entity_type, action, row_id, summary, line_user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entity_type,
+                    action,
+                    row_id,
+                    summary,
+                    line_user_id,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        logger.exception("Failed to write sql change log entity=%s action=%s row_id=%s", entity_type, action, row_id)
+
+
 def init_db() -> None:
     with get_db() as conn:
         conn.execute(
@@ -470,6 +540,20 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS sql_change_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                action TEXT NOT NULL,
+                row_id INTEGER,
+                summary TEXT NOT NULL,
+                line_user_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sql_change_logs_created_at ON sql_change_logs(created_at)")
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS utterance_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id TEXT,
@@ -491,6 +575,19 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_event_receipts (
+                dedup_key TEXT PRIMARY KEY,
+                webhook_event_id TEXT,
+                message_id TEXT,
+                event_type TEXT,
+                chat_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_line_event_receipts_created_at ON line_event_receipts(created_at)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS expenses (
@@ -2164,7 +2261,7 @@ def create_payable(
         if existing:
             return build_existing_payable_reply(existing, "\u9019\u7b46\u5f85\u7e73\u6b3e\u5df2\u7d93\u5b58\u5728")
 
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO payables (
                 line_user_id, item_type, amount, currency, due_date, owner, bank, note, message_id, status, created_at
@@ -2184,7 +2281,9 @@ def create_payable(
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        payable_id = int(cursor.lastrowid)
         conn.commit()
+    log_sql_change("payable", "insert", payable_id, f"{item_type} TWD {amount} {due_date}", line_user_id)
 
     due = datetime.strptime(due_date, "%Y-%m-%d").date()
     reminder_dates = [
@@ -2309,7 +2408,7 @@ def save_income(raw_text: str, line_user_id: str | None) -> str | None:
                 f"\u91d1\u984d\uff1aTWD {amount}"
             )
 
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO incomes (
                 line_user_id, raw_text, income_date, amount, currency, income_type, item_name, owner, category, note, created_at
@@ -2330,7 +2429,9 @@ def save_income(raw_text: str, line_user_id: str | None) -> str | None:
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        income_id = int(cursor.lastrowid)
         conn.commit()
+    log_sql_change("income", "insert", income_id, raw_text, line_user_id)
 
     return (
         "\u5df2\u8a18\u9304\u6536\u5165\n"
@@ -2443,6 +2544,7 @@ def build_payable_list_reply(raw_text: str, line_user_id: str | None) -> str | N
     if not line_user_id or not is_payable_query(raw_text):
         return None
 
+    scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
     item_type = get_payable_type(raw_text)
     owner = get_owner(raw_text)
     bank = get_bank(raw_text)
@@ -2453,12 +2555,11 @@ def build_payable_list_reply(raw_text: str, line_user_id: str | None) -> str | N
     else:
         end_date = date(today.year, today.month + 1, 1) - timedelta(days=1)
 
-    where = [
-        "line_user_id = ?",
-        "status = 'unpaid'",
-        "due_date BETWEEN ? AND ?",
-    ]
-    params: list[str | int | None] = [line_user_id, start_date.isoformat(), end_date.isoformat()]
+    where = ["status = 'unpaid'", "due_date BETWEEN ? AND ?"]
+    params: list[str | int | None] = [start_date.isoformat(), end_date.isoformat()]
+    if scope_line_user_id is not None:
+        where.insert(0, "line_user_id = ?")
+        params.insert(0, scope_line_user_id)
     if item_type:
         where.append("item_type = ?")
         params.append(item_type)
@@ -2468,6 +2569,7 @@ def build_payable_list_reply(raw_text: str, line_user_id: str | None) -> str | N
     if bank:
         where.append("bank = ?")
         params.append(bank)
+    where_sql = " AND ".join(where)
 
     with get_db() as conn:
         rows = conn.execute(
@@ -2503,14 +2605,19 @@ def build_one_payable_query_reply(
     start_date: date,
     end_date: date,
 ) -> str:
-    where = ["line_user_id = ?", "item_type = ?", "due_date BETWEEN ? AND ?"]
-    params: list[str | int | None] = [line_user_id, item_type, start_date.isoformat(), end_date.isoformat()]
+    scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
+    where = ["item_type = ?", "due_date BETWEEN ? AND ?"]
+    params: list[str | int | None] = [item_type, start_date.isoformat(), end_date.isoformat()]
+    if scope_line_user_id is not None:
+        where.insert(0, "line_user_id = ?")
+        params.insert(0, scope_line_user_id)
     if owner:
         where.append("owner = ?")
         params.append(owner)
     if bank:
         where.append("bank = ?")
         params.append(bank)
+    where_sql = " AND ".join(where)
 
     with get_db() as conn:
         rows = conn.execute(
@@ -2570,14 +2677,18 @@ def build_payable_query_reply(
 
     try:
         dedupe_payables(line_user_id)
+        scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
         query = parse_payable_query(raw_text, route)
         query.item_type = normalize_payable_item_type(query.item_type) or query.item_type
         start_date, end_date = current_month_range()
         start = query.start_date or start_date.isoformat()
         end = query.end_date or end_date.isoformat()
 
-        where = ["line_user_id = ?", "due_date BETWEEN ? AND ?"]
-        params: list[str | int | None] = [line_user_id, start, end]
+        where = ["due_date BETWEEN ? AND ?"]
+        params: list[str | int | None] = [start, end]
+        if scope_line_user_id is not None:
+            where.insert(0, "line_user_id = ?")
+            params.insert(0, scope_line_user_id)
         if query.item_type:
             where.append("item_type = ?")
             params.append(query.item_type)
@@ -2709,6 +2820,11 @@ async def push_line_messages(line_user_id: str, messages: list[dict]) -> None:
         log_usage("line", "push", success=True, latency_ms=latency_ms)
         if any(message.get("type") == "image" for message in messages):
             log_usage("line", "image", success=True, latency_ms=latency_ms)
+    except httpx.HTTPStatusError as exc:
+        log_line_api_http_error("push", exc)
+        latency_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+        log_usage("line", "push", success=False, latency_ms=latency_ms)
+        raise
     except Exception:
         latency_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
         log_usage("line", "push", success=False, latency_ms=latency_ms)
@@ -2820,7 +2936,7 @@ def is_confirm_delete_all_intent(text: str) -> bool:
 
 
 def is_confirm_delete_intent(text: str) -> bool:
-    return any(keyword in text for keyword in ("確認刪除", "確定刪除"))
+    return re.sub(r"\s+", "", text) == "88"
 
 
 def is_update_intent(text: str) -> bool:
@@ -3638,6 +3754,7 @@ def payable_item_type_to_expense_category(item_type: str | None) -> str:
 
 
 def get_actual_spending_rows(start_date: str, end_date: str, line_user_id: str | None) -> list[dict[str, object]]:
+    scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
     with get_db() as conn:
         expense_rows = conn.execute(
             """
@@ -3653,7 +3770,7 @@ def get_actual_spending_rows(start_date: str, end_date: str, line_user_id: str |
               AND LOWER(raw_text) NOT LIKE 'delete%'
               AND (? IS NULL OR line_user_id = ? OR line_user_id IS NULL)
             """,
-            (start_date, end_date, line_user_id, line_user_id),
+            (start_date, end_date, scope_line_user_id, scope_line_user_id),
         ).fetchall()
         paid_payable_rows = conn.execute(
             """
@@ -3675,7 +3792,7 @@ def get_actual_spending_rows(start_date: str, end_date: str, line_user_id: str |
               AND COALESCE(date(paid_at), due_date) BETWEEN ? AND ?
               AND (? IS NULL OR line_user_id = ? OR line_user_id IS NULL)
             """,
-            (start_date, end_date, line_user_id, line_user_id),
+            (start_date, end_date, scope_line_user_id, scope_line_user_id),
         ).fetchall()
 
     rows: list[dict[str, object]] = []
@@ -3844,6 +3961,7 @@ def build_expense_where_clauses(
     *,
     include_exclusions: bool = True,
 ) -> tuple[str, list[str | int | None]]:
+    scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
     ranges = query.date_ranges or default_expense_query_dates(query.date_range_type, "")
     date_sql = " OR ".join("(date BETWEEN ? AND ?)" for _ in ranges)
     where = [
@@ -3860,7 +3978,7 @@ def build_expense_where_clauses(
     params: list[str | int | None] = []
     for range_value in ranges:
         params.extend([range_value.start_date, range_value.end_date])
-    params.extend(["TWD", line_user_id, line_user_id])
+    params.extend(["TWD", scope_line_user_id, scope_line_user_id])
 
     include_categories = normalize_category_list(query.include_categories)
     if include_categories:
@@ -4643,6 +4761,7 @@ def find_expense_candidates(
     if amount_match:
         where.append("amount = ?")
         params.append(int(amount_match.group(1)))
+    where_sql = " AND ".join(where)
 
     with get_db() as conn:
         rows = conn.execute(
@@ -4718,7 +4837,7 @@ def build_delete_candidates_reply(raw_text: str, line_user_id: str | None) -> st
         return (
             "找到 1 筆符合的花費：\n"
             f"{row['date']}{time_text} {label} TWD {row['amount']}\n"
-            "若要刪除，請輸入：確認刪除"
+            "若要刪除，請輸入：88"
         )
 
     lines = [
@@ -4798,11 +4917,12 @@ def delete_expense(raw_text: str, line_user_id: str | None) -> DeleteResult:
                 reason=f"已刪除所有記帳資料，共 {cursor.rowcount} 筆。",
             )
 
-    id_match = re.search(r"(?:#|編號\s*|代號\s*)?(\d+)", raw_text)
+    is_delete_confirm = is_confirm_delete_intent(raw_text)
+    id_match = None if is_delete_confirm else re.search(r"(?:#|編號\s*|代號\s*)?(\d+)", raw_text)
     normalized_text = normalize_delete_text(raw_text)
 
     with get_db() as conn:
-        if is_confirm_delete_intent(raw_text) and not id_match:
+        if is_delete_confirm and not id_match:
             pending_id = pending_delete_by_user.get(line_user_id or "")
             if not pending_id:
                 return DeleteResult(deleted=False, reason="目前沒有待確認刪除的花費。請先輸入例如「刪除昨天的消夜」。")
@@ -4823,6 +4943,7 @@ def delete_expense(raw_text: str, line_user_id: str | None) -> DeleteResult:
             conn.commit()
             pending_delete_by_user.pop(line_user_id or "", None)
             expense = row_to_expense(row)
+            log_sql_change("expense", "delete", pending_id, str(row["raw_text"]), line_user_id)
             return DeleteResult(
                 deleted=True,
                 expense=expense,
@@ -4847,6 +4968,7 @@ def delete_expense(raw_text: str, line_user_id: str | None) -> DeleteResult:
             conn.commit()
             pending_delete_by_user.pop(line_user_id or "", None)
             expense = row_to_expense(row)
+            log_sql_change("expense", "delete", expense_id, str(row["raw_text"]), line_user_id)
             return DeleteResult(
                 deleted=True,
                 expense=expense,
@@ -4886,6 +5008,7 @@ def delete_expense(raw_text: str, line_user_id: str | None) -> DeleteResult:
         conn.commit()
         pending_delete_by_user.pop(line_user_id or "", None)
         expense = row_to_expense(row)
+        log_sql_change("expense", "delete", expense_id, str(row["raw_text"]), line_user_id)
         return DeleteResult(
             deleted=True,
             expense=expense,
@@ -5037,8 +5160,10 @@ def save_expense(
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        expense_id = int(cursor.lastrowid)
         conn.commit()
-        return int(cursor.lastrowid)
+    log_sql_change("expense", "insert", expense_id, raw_text, line_user_id)
+    return expense_id
 
 
 def build_reply_text(expense: ExpenseEntry, expense_id: int) -> str:
@@ -5147,6 +5272,11 @@ async def reply_line_messages(reply_token: str, messages: list[dict]) -> None:
         log_usage("line", "reply", success=True, latency_ms=latency_ms)
         if any(message.get("type") == "image" for message in messages):
             log_usage("line", "image", success=True, latency_ms=latency_ms)
+    except httpx.HTTPStatusError as exc:
+        log_line_api_http_error("reply", exc)
+        latency_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+        log_usage("line", "reply", success=False, latency_ms=latency_ms)
+        raise
     except Exception:
         latency_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
         log_usage("line", "reply", success=False, latency_ms=latency_ms)
@@ -5180,6 +5310,25 @@ async def reply_payload_with_token(reply_token: str, reply_payload: object) -> N
 
 async def push_reply_payload(line_user_id: str, reply_payload: object) -> None:
     await push_line_messages(line_user_id, reply_payload_to_messages(reply_payload))
+
+
+async def reply_or_push_messages(reply_token: str, chat_id: str | None, messages: list[dict]) -> None:
+    try:
+        await reply_line_messages(reply_token, messages)
+    except httpx.HTTPStatusError as exc:
+        if chat_id and is_invalid_line_reply_error(exc):
+            logger.warning("LINE reply token unusable; fallback to push for chat_id=%s", chat_id)
+            await push_line_messages(chat_id, messages)
+            return
+        raise
+
+
+async def reply_or_push_text(reply_token: str, chat_id: str | None, text: str) -> None:
+    await reply_or_push_messages(reply_token, chat_id, [{"type": "text", "text": text}])
+
+
+async def reply_or_push_payload(reply_token: str, chat_id: str | None, reply_payload: object) -> None:
+    await reply_or_push_messages(reply_token, chat_id, reply_payload_to_messages(reply_payload))
 
 
 def build_interim_reply(status: str) -> str:
@@ -5246,6 +5395,19 @@ def write_setting_help_reply() -> str:
         "\u8a2d\u5b9a REMINDER 12\n"
         "\u8a2d\u5b9a TIMEOUT 3\n"
         "\u8a2d\u5b9a PUBLIC_BASE_URL https://xxxx.ngrok-free.app"
+    )
+
+
+def commands_help_reply() -> str:
+    return (
+        "\u53ef\u7528\u6307\u4ee4\uff1a\n"
+        "1. commands\n"
+        "2. checkSql\n"
+        "3. readSetting\n"
+        "4. writeSetting\n"
+        "5. usage\n"
+        "6. exportTrainingData\n"
+        "7. cleanCharts"
     )
 
 
@@ -5389,6 +5551,53 @@ def usage_reply(raw_text: str) -> str:
         "\u63d0\u9192\uff1a\n"
         f"- \u4eca\u65e5\u63d0\u9192 push \u6b21\u6578\uff1a{reminder_push_count}"
     )
+
+
+def parse_recent_sql_changes_limit(raw_text: str) -> int | None:
+    normalized = re.sub(r"\s+", "", raw_text).lower()
+    if normalized == "checksql":
+        return 5
+    match = re.match(r"^checksql(\d{1,2})$", normalized)
+    if not match:
+        return None
+    return max(1, min(20, int(match.group(1))))
+
+
+def recent_sql_changes_reply(line_user_id: str | None, limit: int = 5) -> str:
+    today = date.today().isoformat()
+    entity_labels = {
+        "expense": "\u8a18\u5e33",
+        "income": "\u6536\u5165",
+        "payable": "\u5f85\u7e73",
+    }
+    action_labels = {
+        "insert": "\u65b0\u589e",
+        "delete": "\u522a\u9664",
+        "update": "\u66f4\u65b0",
+    }
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, entity_type, action, row_id, summary, created_at
+            FROM sql_change_logs
+            WHERE date(created_at) = ?
+              AND (? IS NULL OR line_user_id = ? OR line_user_id IS NULL)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (today, line_user_id, line_user_id, limit),
+        ).fetchall()
+    if not rows:
+        return f"\u6700\u8fd1{limit}\u7b46 SQL \u65b0\u589e/\u522a\u9664\n\u4eca\u5929\u9084\u6c92\u6709\u8cc7\u6599"
+
+    lines = [f"\u6700\u8fd1{limit}\u7b46 SQL \u65b0\u589e/\u522a\u9664"]
+    for row in rows:
+        created_at = datetime.fromisoformat(str(row["created_at"])).astimezone().strftime("%Y/%m/%d %H:%M:%S")
+        entity = entity_labels.get(str(row["entity_type"]), str(row["entity_type"]))
+        action = action_labels.get(str(row["action"]), str(row["action"]))
+        row_id = f" #{int(row['row_id'])}" if row["row_id"] is not None else ""
+        lines.append(f"{created_at} {entity} {action}{row_id} {row['summary']}")
+    return "\n".join(lines)
 
 
 def clean_charts_reply(raw_text: str, line_user_id: str | None) -> str:
@@ -5575,6 +5784,11 @@ def export_training_data_reply() -> str:
 
 def handle_special_command(raw_text: str, line_user_id: str | None) -> str | None:
     normalized = re.sub(r"\s+", "", raw_text)
+    sql_change_limit = parse_recent_sql_changes_limit(raw_text)
+    if sql_change_limit is not None:
+        return recent_sql_changes_reply(line_user_id, sql_change_limit)
+    if raw_text.strip().lower() in {"commands", "help"} or normalized == "\u6240\u6709\u6307\u4ee4":
+        return commands_help_reply()
     if raw_text.strip().lower() in {"readsetting"} or normalized == "\u8b80\u8a2d\u5b9a":
         return read_settings_reply()
     if raw_text.strip().lower() in {"writesetting"} or normalized == "\u6539\u8a2d\u5b9a":
@@ -5684,6 +5898,7 @@ def build_income_where_clause(
     line_user_id: str | None,
     income_type: str | None,
 ) -> tuple[str, list[object], date, date, str | None]:
+    scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
     start_date, end_date = get_month_range(text)
     aliases = income_type_aliases(income_type or get_income_type(text))
     where_parts = [
@@ -5691,7 +5906,7 @@ def build_income_where_clause(
         "amount > 0",
         "(? IS NULL OR line_user_id = ? OR line_user_id IS NULL)",
     ]
-    params: list[object] = [start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id]
+    params: list[object] = [start_date.isoformat(), end_date.isoformat(), scope_line_user_id, scope_line_user_id]
     if aliases:
         placeholders = ", ".join("?" for _ in aliases)
         where_parts.append(
@@ -5756,6 +5971,7 @@ def build_income_list_reply(text: str, line_user_id: str | None, income_type: st
 
 def get_month_finance(raw_text: str, line_user_id: str | None) -> dict[str, object]:
     start_date, end_date = get_month_range(raw_text)
+    scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
     with get_db() as conn:
         income_rows = conn.execute(
             """
@@ -5765,7 +5981,7 @@ def get_month_finance(raw_text: str, line_user_id: str | None) -> dict[str, obje
               AND (? IS NULL OR line_user_id = ? OR line_user_id IS NULL)
             ORDER BY income_date ASC, id ASC
             """,
-            (start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id),
+            (start_date.isoformat(), end_date.isoformat(), scope_line_user_id, scope_line_user_id),
         ).fetchall()
         payable_row = conn.execute(
             """
@@ -5775,7 +5991,7 @@ def get_month_finance(raw_text: str, line_user_id: str | None) -> dict[str, obje
               AND status = 'unpaid'
               AND (? IS NULL OR line_user_id = ? OR line_user_id IS NULL)
             """,
-            (start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id),
+            (start_date.isoformat(), end_date.isoformat(), scope_line_user_id, scope_line_user_id),
         ).fetchone()
         payable_rows = conn.execute(
             """
@@ -5787,10 +6003,10 @@ def get_month_finance(raw_text: str, line_user_id: str | None) -> dict[str, obje
             ORDER BY due_date ASC, id ASC
             LIMIT 12
             """,
-            (start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id),
+            (start_date.isoformat(), end_date.isoformat(), scope_line_user_id, scope_line_user_id),
         ).fetchall()
 
-    actual_rows = get_actual_spending_rows(start_date.isoformat(), end_date.isoformat(), line_user_id)
+    actual_rows = get_actual_spending_rows(start_date.isoformat(), end_date.isoformat(), scope_line_user_id)
     expense_rows = sort_actual_spending_rows(
         actual_rows,
         ExpenseQuery(
@@ -5907,6 +6123,7 @@ def build_available_cash_reply(raw_text: str, line_user_id: str | None, route: A
 def build_balance_reply(raw_text: str, line_user_id: str | None) -> str:
     start_date, end_date = get_month_range(raw_text)
     show_details = wants_balance_details(raw_text)
+    scope_line_user_id = get_household_read_scope_line_user_id(line_user_id)
     with get_db() as conn:
         income_rows = conn.execute(
             """
@@ -5916,7 +6133,7 @@ def build_balance_reply(raw_text: str, line_user_id: str | None) -> str:
               AND (? IS NULL OR line_user_id = ? OR line_user_id IS NULL)
             ORDER BY income_date ASC, id ASC
             """,
-            (start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id),
+            (start_date.isoformat(), end_date.isoformat(), scope_line_user_id, scope_line_user_id),
         ).fetchall()
         payable_row = conn.execute(
             """
@@ -5926,7 +6143,7 @@ def build_balance_reply(raw_text: str, line_user_id: str | None) -> str:
               AND status = 'unpaid'
               AND (? IS NULL OR line_user_id = ? OR line_user_id IS NULL)
             """,
-            (start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id),
+            (start_date.isoformat(), end_date.isoformat(), scope_line_user_id, scope_line_user_id),
         ).fetchone()
         payable_rows = conn.execute(
             """
@@ -5938,10 +6155,10 @@ def build_balance_reply(raw_text: str, line_user_id: str | None) -> str:
             ORDER BY due_date ASC, id ASC
             LIMIT 12
             """,
-            (start_date.isoformat(), end_date.isoformat(), line_user_id, line_user_id),
+            (start_date.isoformat(), end_date.isoformat(), scope_line_user_id, scope_line_user_id),
         ).fetchall()
 
-    actual_rows = get_actual_spending_rows(start_date.isoformat(), end_date.isoformat(), line_user_id)
+    actual_rows = get_actual_spending_rows(start_date.isoformat(), end_date.isoformat(), scope_line_user_id)
     expense_rows = sort_actual_spending_rows(
         actual_rows,
         ExpenseQuery(
@@ -6285,6 +6502,74 @@ def in_flight_key(chat_id: str | None, actor_user_id: str | None, raw_text: str)
     return f"{chat_id or '_chat'}:{actor_user_id or '_actor'}:{normalize_in_flight_text(raw_text)}"
 
 
+def get_line_event_dedup_key(event: dict) -> str | None:
+    webhook_event_id = event.get("webhookEventId")
+    if isinstance(webhook_event_id, str) and webhook_event_id:
+        return f"webhook:{webhook_event_id}"
+    message = event.get("message", {})
+    message_id = message.get("id")
+    if isinstance(message_id, str) and message_id:
+        return f"message:{message_id}"
+    return None
+
+
+def claim_line_event_receipt(event: dict, now: datetime | None = None) -> bool:
+    dedup_key = get_line_event_dedup_key(event)
+    if not dedup_key:
+        return True
+
+    current_time = now or datetime.now(timezone.utc)
+    cutoff = current_time - timedelta(days=14)
+    message = event.get("message", {})
+    source = event.get("source", {})
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "DELETE FROM line_event_receipts WHERE created_at < ?",
+                (cutoff.isoformat(),),
+            )
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO line_event_receipts (
+                    dedup_key, webhook_event_id, message_id, event_type, chat_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dedup_key,
+                    event.get("webhookEventId"),
+                    message.get("id"),
+                    event.get("type"),
+                    get_line_chat_id(source),
+                    current_time.isoformat(),
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error:
+        logger.exception("Failed to claim LINE event receipt dedup_key=%s", dedup_key)
+        return True
+
+
+def is_duplicate_line_event(event: dict, now: datetime | None = None) -> bool:
+    dedup_key = get_line_event_dedup_key(event)
+    if not dedup_key:
+        return False
+
+    current_time = now or datetime.now(timezone.utc)
+    cutoff = current_time - timedelta(seconds=LINE_EVENT_DEDUP_WINDOW_SECONDS)
+    expired_keys = [key for key, seen_at in recent_line_event_times.items() if seen_at < cutoff]
+    for key in expired_keys:
+        recent_line_event_times.pop(key, None)
+
+    seen_at = recent_line_event_times.get(dedup_key)
+    if seen_at and seen_at >= cutoff:
+        return True
+
+    recent_line_event_times[dedup_key] = current_time
+    return False
+
+
 def process_message_sync(ctx: ProcessingContext, event: dict) -> object:
     message = event.get("message", {})
     raw_text = message.get("text", "").strip()
@@ -6368,7 +6653,11 @@ async def handle_text_event(event: dict) -> None:
             and isinstance(started_at, datetime)
             and (now - started_at).total_seconds() <= 10
         ):
-            await reply_line_message(reply_token, f"\u6211\u9084\u5728\u8655\u7406\u4e0a\u4e00\u500b\u67e5\u8a62\uff0c\u76ee\u524d\u6b63\u5728{ctx.status}\uff0c\u7b49\u6211\u4e00\u4e0b\u3002")
+            await reply_or_push_text(
+                reply_token,
+                chat_id,
+                f"\u6211\u9084\u5728\u8655\u7406\u4e0a\u4e00\u500b\u67e5\u8a62\uff0c\u76ee\u524d\u6b63\u5728{ctx.status}\uff0c\u7b49\u6211\u4e00\u4e0b\u3002",
+            )
             return
 
     ctx = ProcessingContext(
@@ -6385,16 +6674,23 @@ async def handle_text_event(event: dict) -> None:
     try:
         reply_payload = await asyncio.wait_for(asyncio.shield(task), timeout=get_processing_timeout_seconds())
         ctx.final_replied = True
-        await reply_payload_with_token(reply_token, reply_payload)
+        await reply_or_push_payload(reply_token, chat_id, reply_payload)
         in_flight_tasks.pop(key, None)
     except asyncio.TimeoutError:
         ctx.interim_replied = True
-        await reply_line_message(reply_token, build_interim_reply(ctx.status))
+        await reply_or_push_text(reply_token, chat_id, build_interim_reply(ctx.status))
         task.add_done_callback(lambda done_task: asyncio.create_task(finalize_background_message(ctx, done_task, key)))
     except Exception:
         logger.exception("Failed to handle LINE text: %s", raw_text)
         in_flight_tasks.pop(key, None)
-        await reply_line_message(reply_token, "\u525b\u525b\u8655\u7406\u5931\u6557\u4e86\uff0c\u6211\u6709\u8a18\u9304\u932f\u8aa4\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66\u3002")
+        try:
+            await reply_or_push_text(
+                reply_token,
+                chat_id,
+                "\u525b\u525b\u8655\u7406\u5931\u6557\u4e86\uff0c\u6211\u6709\u8a18\u9304\u932f\u8aa4\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66\u3002",
+            )
+        except Exception:
+            logger.exception("Failed to send LINE error notification.")
 
 
 @app.get("/health")
@@ -6483,6 +6779,16 @@ async def line_webhook(
     for event in events:
         log_usage("line", "webhook", detail=event.get("type"), success=True)
         if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
-            await handle_text_event(event)
+            dedup_key = get_line_event_dedup_key(event)
+            if not claim_line_event_receipt(event):
+                logger.info("Skip persisted duplicate LINE event dedup_key=%s", dedup_key)
+                continue
+            if is_duplicate_line_event(event):
+                logger.info("Skip in-memory duplicate LINE event dedup_key=%s", dedup_key)
+                continue
+            try:
+                await handle_text_event(event)
+            except Exception:
+                logger.exception("Unhandled LINE event processing failure.")
 
     return {"status": "ok"}

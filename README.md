@@ -71,6 +71,7 @@ ngrok http 8000
 
 ```text
 https://你的公開網址/line/webhook
+ngrok http --url=sixth-impulse-spiffy.ngrok-free.dev 8000
 ```
 
 並確認：

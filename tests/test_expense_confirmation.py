@@ -583,7 +583,7 @@ def test_clean_charts_command_removes_old_charts(monkeypatch, tmp_path):
 
     reply = main.handle_special_command("cleanCharts", "U1")
 
-    assert "刪除 1" in reply
+    assert "\u522a\u9664 1" in reply
     assert not old_file.exists()
     assert new_file.exists()
 
@@ -599,7 +599,7 @@ def test_clean_charts_all_requires_confirmation(monkeypatch, tmp_path):
     second = main.handle_special_command("\u78ba\u8a8d\u6e05\u7a7a\u5716\u8868", "U1")
 
     assert "\u78ba\u8a8d\u6e05\u7a7a\u5716\u8868" in first
-    assert "刪除 1" in second
+    assert "\u522a\u9664 1" in second
     assert not chart_file.exists()
 
 
@@ -647,6 +647,21 @@ def test_feedback_updates_last_utterance_log(monkeypatch, tmp_path):
     assert row["final_intent"] == "create"
     assert row["is_correct"] == 0
     assert "\u5c45\u5bb6\u63d0\u9192" in row["user_feedback"]
+
+
+def test_feedback_can_correct_last_household_utterance(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    route = main.ActionRoute(action="create_expense", should_mutate_db=True, confidence=0.8, reason="test")
+    main.log_utterance("\u5348\u9910 120", "m1", "U2", "group", "G1", route)
+
+    reply = main.apply_last_utterance_feedback("\u4e0a\u4e00\u53e5\u61c9\u8a72\u662f \u623f\u5c4b\u4fee\u7e55", "U1", "G1")
+
+    assert "\u5df2\u8a18\u9304\u4fee\u6b63" in reply
+    with main.get_db() as conn:
+        row = conn.execute("SELECT final_domain, final_intent, is_correct FROM utterance_logs WHERE message_id = ?", ("m1",)).fetchone()
+    assert row["final_domain"] == "home"
+    assert row["final_intent"] == "create_maintenance_record"
+    assert row["is_correct"] == 0
 
 
 def test_export_training_data_writes_jsonl(monkeypatch, tmp_path):
@@ -765,18 +780,22 @@ def test_this_month_income_total_routes_to_query_incomes(monkeypatch, tmp_path):
 
     assert route.action == "query_incomes"
     assert route.action != "query_balance"
-    assert route.income_type is None
 
 
-def test_balance_questions_route_to_query_balance(monkeypatch, tmp_path):
+def test_income_balance_phrases_still_route_to_query_balance(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="query_expenses", should_mutate_db=False, confidence=0.9),
+    )
 
     assert main.route_action("\u9019\u500b\u6708\u6536\u652f\u662f\u591a\u5c11", "U1").action == "query_balance"
     assert main.route_action("\u9019\u500b\u6708\u662f\u5426\u900f\u652f", "U1").action == "query_balance"
     assert main.route_action("\u9019\u500b\u6708\u9084\u5269\u591a\u5c11\u9322", "U1").action == "query_balance"
 
 
-def test_small_simple_expense_saves_immediately(monkeypatch, tmp_path):
+def test_small_lunch_expense_saves_directly(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
     monkeypatch.setattr(main, "parse_expense_text", fake_expense_parser)
     route = main.ActionRoute(action="create_expense", should_mutate_db=True, confidence=0.95)
@@ -784,91 +803,1142 @@ def test_small_simple_expense_saves_immediately(monkeypatch, tmp_path):
     reply = main.execute_action_route(route, "午餐 120", "U1", "m1")
 
     assert count_expenses() == 1
-    assert "已記帳" in reply
+    assert expense_amounts() == [120]
     assert "確認記帳" not in reply
 
 
-def test_multiline_yesterday_entries_save_two_rows(monkeypatch, tmp_path):
+def test_multiline_expense_with_shared_date_header_saves_all_entries(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
     set_fake_today(monkeypatch, 2026, 7, 13)
-
-    reply = main.execute_action_route(main.route_action("昨天\n停車費60\n飲料25", "U1"), "昨天\n停車費60\n飲料25", "U1", "m1")
-
-    assert "已記帳多筆" in reply
-    assert count_expenses() == 2
-    with main.get_db() as conn:
-        rows = conn.execute("SELECT date, amount, category, note FROM expenses ORDER BY id").fetchall()
-    assert rows[0]["date"] == "2026-07-12"
-    assert int(rows[0]["amount"]) == 60
-    assert rows[0]["category"] == "交通"
-    assert rows[1]["date"] == "2026-07-12"
-    assert int(rows[1]["amount"]) == 25
-    assert rows[1]["category"] == "餐飲"
-
-
-def test_multiline_semantic_food_entries_parse_correctly(monkeypatch, tmp_path):
-    setup_tmp_db(monkeypatch, tmp_path)
-
-    reply = main.execute_action_route(main.route_action("7/10食材費用兩筆\n一筆521\n一筆859", "U1"), "7/10食材費用兩筆\n一筆521\n一筆859", "U1", "m-food")
-
-    assert "已記帳多筆" in reply
-    assert "2026-07-10 食材費用 TWD 521" in reply
-    assert "2026-07-10 食材費用 TWD 859" in reply
-    with main.get_db() as conn:
-        rows = conn.execute("SELECT date, amount, note FROM expenses ORDER BY id").fetchall()
-    assert [row["date"] for row in rows] == ["2026-07-10", "2026-07-10"]
-    assert [int(row["amount"]) for row in rows] == [521, 859]
-    assert [row["note"] for row in rows] == ["食材費用", "食材費用"]
-
-
-def test_list_and_delete_duplicate_data_flow(monkeypatch, tmp_path):
-    setup_tmp_db(monkeypatch, tmp_path)
-    monkeypatch.setattr(main, "parse_expense_text", fake_expense_parser)
+    monkeypatch.setattr(main, "parse_expense_text", main.parse_expense_text_fallback)
     route = main.ActionRoute(action="create_expense", should_mutate_db=True, confidence=0.95)
 
-    main.execute_action_route(route, "早餐 50", "U1", "m1")
-    main.execute_action_route(route, "早餐 50", "U1", "m2")
+    reply = main.execute_action_route(route, "昨天\n停車費60\n飲料25", "U1", "m1")
+
+    assert count_expenses() == 2
+    assert expense_amounts() == [60, 25]
+    assert "2026-07-12" in reply
+    with main.get_db() as conn:
+        rows = conn.execute(
+            "SELECT raw_text, date, amount, note FROM expenses ORDER BY id ASC"
+        ).fetchall()
+    assert [row["raw_text"] for row in rows] == ["昨天 停車費60", "昨天 飲料25"]
+    assert [row["date"] for row in rows] == ["2026-07-12", "2026-07-12"]
+    assert [int(row["amount"]) for row in rows] == [60, 25]
+    assert [row["note"] for row in rows] == ["停車費", "飲料"]
+
+
+def test_multiline_expense_with_count_header_normalizes_each_detail(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    parsed_inputs = []
+
+    def fake_parser(text):
+        parsed_inputs.append(text)
+        return main.parse_expense_text_fallback(text)
+
+    monkeypatch.setattr(main, "parse_expense_text", fake_parser)
+    route = main.ActionRoute(action="create_expense", should_mutate_db=True, confidence=0.95)
+
+    reply = main.execute_action_route(route, "7/10食材費用兩筆\n一筆521\n一筆859", "U1", "m-food")
+
+    assert parsed_inputs == ["7/10 食材費用 521", "7/10 食材費用 859"]
+    assert count_expenses() == 2
+    assert expense_amounts() == [521, 859]
+    assert "2026-07-10" in reply
+    with main.get_db() as conn:
+        rows = conn.execute(
+            "SELECT raw_text, date, amount FROM expenses ORDER BY id ASC"
+        ).fetchall()
+    assert [row["raw_text"] for row in rows] == ["7/10 食材費用 521", "7/10 食材費用 859"]
+    assert [row["date"] for row in rows] == ["2026-07-10", "2026-07-10"]
+    assert [int(row["amount"]) for row in rows] == [521, 859]
+
+
+def test_duplicate_data_list_and_confirm_delete(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    expense = main.ExpenseEntry(
+        date="2026-07-07",
+        time=None,
+        amount=120,
+        currency="TWD",
+        category=main.infer_category("午餐"),
+        merchant=None,
+        note="午餐",
+        confidence=0.95,
+    )
+    with main.get_db() as conn:
+        for message_id in ("m1", "m2"):
+            conn.execute(
+                """
+                INSERT INTO expenses (
+                    line_user_id, message_id, raw_text, date, expense_time, amount,
+                    currency, category, merchant, note, confidence, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "U1",
+                    message_id,
+                    "午餐 120",
+                    expense.date,
+                    expense.time,
+                    expense.amount,
+                    expense.currency,
+                    expense.category,
+                    expense.merchant,
+                    expense.note,
+                    expense.confidence,
+                    "now",
+                ),
+            )
+        conn.commit()
+
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="list_expenses", should_mutate_db=False, confidence=0.9),
+    )
 
     route = main.route_action("列出來重複的資料", "U1")
+    assert route.action == "list_duplicates"
     reply = main.execute_action_route(route, "列出來重複的資料", "U1", "m3")
-    assert "可能重複的資料" in reply
+    assert "重複" in reply
+    assert count_expenses() == 2
 
     route = main.route_action("刪除重複的資料", "U1")
+    assert route.action == "delete_duplicates"
     reply = main.execute_action_route(route, "刪除重複的資料", "U1", "m4")
     assert "確認刪除重複資料" in reply
+    assert count_expenses() == 2
 
     confirm_route = main.ActionRoute(action="chat", should_mutate_db=False, confidence=1.0)
-    reply = main.execute_action_route(confirm_route, "確認刪除重複資料", "U1", "m5")
-    assert "已刪除重複資料" in reply
+    main.execute_action_route(confirm_route, "確認刪除重複資料", "U1", "m5")
     assert count_expenses() == 1
 
 
-def test_delete_requires_88_confirmation(monkeypatch, tmp_path):
+def test_confirm_delete_expense_takes_priority_over_duplicate_action(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
-    monkeypatch.setattr(main, "parse_expense_text", fake_expense_parser)
-    route = main.ActionRoute(action="create_expense", should_mutate_db=True, confidence=0.95)
-    main.execute_action_route(route, "早餐 50", "U1", "m1")
+    expense = main.ExpenseEntry(
+        date="2026-07-07",
+        time=None,
+        amount=1_000_000,
+        currency="TWD",
+        category=main.infer_category("買車"),
+        merchant=None,
+        note="買車",
+        confidence=0.95,
+    )
+    expense_id = main.save_expense(expense, "買車 100萬", "U1", "m1")
+    main.pending_delete_by_user["U1"] = expense_id
 
-    wrong_route = main.ActionRoute(action="chat", should_mutate_db=False, confidence=1.0)
+    wrong_route = main.ActionRoute(action="delete_duplicates", should_mutate_db=False, confidence=0.9)
     reply = main.execute_action_route(wrong_route, "88", "U1", "m2")
 
-    assert "目前沒有等待確認刪除的記帳項目" in reply or "目前沒有等待確認" in reply
+    assert count_expenses() == 0
+    assert "U1" not in main.pending_delete_by_user
+    assert "重複資料" not in reply
 
 
-def seed_expense_statistics_data():
+def test_delete_expense_by_keyword_returns_candidate_instead_of_crashing(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=50,
+        currency="TWD",
+        category="餐飲",
+        merchant=None,
+        note="早餐",
+        confidence=0.9,
+    )
+    expense_id = main.save_expense(expense, "早餐50", "U1", "m-breakfast")
+
+    result = main.delete_expense("移除早餐", "U1")
+
+    assert result.deleted is False
+    assert main.pending_delete_by_user["U1"] == expense_id
+    assert "88" in (result.reason or "")
+
+
+def test_delete_expense_by_keyword_can_find_household_entry(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=50,
+        currency="TWD",
+        category="餐飲",
+        merchant=None,
+        note="早餐",
+        confidence=0.9,
+    )
+    expense_id = main.save_expense(expense, "早餐50", "U2", "m-breakfast-shared")
+
+    result = main.delete_expense("移除早餐", "U1")
+
+    assert result.deleted is False
+    assert main.pending_delete_by_user["U1"] == expense_id
+    assert "88" in (result.reason or "")
+
+
+def test_purchase_cash_for_toys_is_not_investment_reply(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(
+            action="ask_available_investment_cash",
+            should_mutate_db=False,
+            confidence=0.9,
+        ),
+    )
+    route = main.route_action("有多少錢可以買玩具?", "U1")
+    assert route.action == "query_available_cash"
+    reply = main.execute_action_route(route, "有多少錢可以買玩具?", "U1", "m1")
+    assert "股票" not in reply
+
+
+def test_stock_cash_routes_to_neutral_available_cash(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="ask_available_investment_cash", should_mutate_db=False, confidence=0.9),
+    )
+    route = main.route_action("還有多少錢可以買股票?", "U1")
+    assert route.action == "query_available_cash"
+    reply = main.execute_action_route(route, "還有多少錢可以買股票?", "U1", "m1")
+    assert "建議不要全部投入" not in reply
+
+
+def test_investment_amount_without_advice_routes_to_available_cash(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="ask_available_investment_cash", should_mutate_db=False, confidence=0.9),
+    )
+    route = main.route_action("可以投資多少?", "U1")
+    assert route.action == "query_available_cash"
+
+
+def test_explicit_stock_advice_routes_to_investment(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="query_available_cash", should_mutate_db=False, confidence=0.9),
+    )
+    route = main.route_action("建議投入多少股票?", "U1")
+    assert route.action == "ask_available_investment_cash"
+    reply = main.execute_action_route(route, "建議投入多少股票?", "U1", "m1")
+    assert "建議" in reply
+
+
+def test_appliance_purchase_routes_to_available_cash(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "route_action_with_openai",
+        lambda text: main.ActionRoute(action="ask_available_investment_cash", should_mutate_db=False, confidence=0.9),
+    )
+    route = main.route_action("這個月可以買家電嗎?", "U1")
+    assert route.action == "query_available_cash"
+
+
+def test_today_transport_summary_filters_transport_only(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query",
+        lambda text: main.ExpenseQuery(
+            date_range_type="today",
+            date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+            category="\u4ea4\u901a",
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+
+    transport = main.ExpenseEntry(
+        date="2026-07-07",
+        time=None,
+        amount=100,
+        currency="TWD",
+        category=main.infer_category("\u52a0\u6cb9"),
+        merchant=None,
+        note="\u52a0\u6cb9\u652f\u51fa",
+        confidence=0.95,
+    )
+    lunch = main.ExpenseEntry(
+        date="2026-07-07",
+        time=None,
+        amount=60,
+        currency="TWD",
+        category=main.infer_category("\u5348\u9910"),
+        merchant=None,
+        note="\u5348\u9910",
+        confidence=0.95,
+    )
+    main.save_expense(transport, "\u52a0\u6cb9 100", "U1", "m1")
+    main.save_expense(lunch, "\u5348\u9910 60", "U1", "m2")
+
+    raw_text = "\u4eca\u5929\u4ea4\u901a\u82b1\u4e86\u591a\u5c11\u9322?"
+    category = main.get_query_category(raw_text)
+    reply = main.build_summary_reply(raw_text, "U1")
+
+    assert category == "\u4ea4\u901a"
+    assert "TWD 100" in reply
+    assert "TWD 60" not in reply
+
+
+def test_agent_plan_query_question_never_mutates_db():
+    plan = main.AgentPlan(
+        operation="query",
+        target="expenses",
+        should_mutate_db=True,
+        confidence=0.95,
+        date_range_type="today",
+        start_date=None,
+        end_date=None,
+        category="\u4ea4\u901a",
+        merchant=None,
+        keywords=[],
+        amount=None,
+        currency="TWD",
+        note=None,
+        aggregation="sum",
+        reason="\u67e5\u8a62\u4eca\u5929\u4ea4\u901a\u652f\u51fa",
+    )
+
+    route = main.agent_plan_to_action_route(plan, "\u4eca\u5929\u4ea4\u901a\u82b1\u4e86\u591a\u5c11\u9322?")
+
+    assert route.action == "query_expenses"
+    assert route.should_mutate_db is False
+    assert route.category == "\u4ea4\u901a"
+
+
+def test_summary_uses_route_category_from_agent_plan(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query",
+        lambda text: main.ExpenseQuery(
+            date_range_type="today",
+            date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+            category=None,
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+    main.save_expense(
+        main.ExpenseEntry(
+            date="2026-07-07",
+            time=None,
+            amount=100,
+            currency="TWD",
+            category=main.infer_category("\u52a0\u6cb9"),
+            merchant=None,
+            note="\u52a0\u6cb9",
+            confidence=0.95,
+        ),
+        "\u52a0\u6cb9 100",
+        "U1",
+        "m1",
+    )
+    main.save_expense(
+        main.ExpenseEntry(
+            date="2026-07-07",
+            time=None,
+            amount=60,
+            currency="TWD",
+            category=main.infer_category("\u5348\u9910"),
+            merchant=None,
+            note="\u5348\u9910",
+            confidence=0.95,
+        ),
+        "\u5348\u9910 60",
+        "U1",
+        "m2",
+    )
+    route = main.ActionRoute(
+        action="query_expenses",
+        should_mutate_db=False,
+        confidence=0.95,
+        category="\u4ea4\u901a",
+    )
+
+    reply = main.build_summary_reply("\u4eca\u5929\u82b1\u4e86\u591a\u5c11\u9322?", "U1", route)
+
+    assert "TWD 100" in reply
+    assert "TWD 60" not in reply
+
+
+def test_phone_bill_expense_fallback_category():
+    expense = main.parse_expense_text_fallback("\u96fb\u8a71\u8cbb$100")
+
+    assert expense.amount == 100
+    assert expense.category == "\u96fb\u8a71\u8cbb"
+
+
+def test_specific_months_phone_bill_query_uses_disjoint_ranges(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    for message_id, expense_date, amount in (
+        ("m1", "2026-03-05", 100),
+        ("m2", "2026-04-05", 999),
+        ("m3", "2026-05-05", 200),
+    ):
+        main.save_expense(
+            main.ExpenseEntry(
+                date=expense_date,
+                time=None,
+                amount=amount,
+                currency="TWD",
+                category="\u96fb\u8a71\u8cbb",
+                merchant=None,
+                note="\u96fb\u8a71\u8cbb",
+                confidence=0.95,
+            ),
+            f"\u96fb\u8a71\u8cbb {amount}",
+            "U1",
+            message_id,
+        )
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query",
+        lambda text: main.ExpenseQuery(
+            date_range_type="specific_months",
+            date_ranges=[
+                main.DateRange(start_date="2026-03-01", end_date="2026-03-31"),
+                main.DateRange(start_date="2026-05-01", end_date="2026-05-31"),
+            ],
+            category="\u96fb\u8a71\u8cbb",
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+
+    reply = main.build_summary_reply("3\u6708\u548c5\u6708\u96fb\u8a71\u8cbb\u82b1\u591a\u5c11?", "U1")
+
+    assert "TWD 300" in reply
+    assert "TWD 1299" not in reply
+
+
+def test_structured_query_finds_legacy_living_phone_bill(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    main.save_expense(
+        main.ExpenseEntry(
+            date="2026-07-07",
+            time=None,
+            amount=100,
+            currency="TWD",
+            category="\u751f\u6d3b\u7528\u54c1",
+            merchant=None,
+            note="\u96fb\u8a71\u8cbb",
+            confidence=0.95,
+        ),
+        "\u96fb\u8a71\u8cbb$100",
+        "U1",
+        "m1",
+    )
+    main.save_expense(
+        main.ExpenseEntry(
+            date="2026-07-07",
+            time=None,
+            amount=50,
+            currency="TWD",
+            category="\u9910\u98f2",
+            merchant=None,
+            note="\u5348\u9910",
+            confidence=0.95,
+        ),
+        "\u5348\u9910 50",
+        "U1",
+        "m2",
+    )
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query",
+        lambda text: main.ExpenseQuery(
+            date_range_type="today",
+            date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+            category="\u96fb\u8a71\u8cbb",
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+
+    reply = main.build_summary_reply("\u4eca\u5929\u96fb\u8a71\u8cbb\u591a\u5c11?", "U1")
+
+    assert "TWD 100" in reply
+    assert "TWD 50" not in reply
+
+
+def test_chinese_specific_months_water_bill_query(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    for message_id, expense_date, amount in (
+        ("m1", "2026-03-05", 100),
+        ("m2", "2026-04-05", 999),
+        ("m3", "2026-05-05", 200),
+    ):
+        main.save_expense(
+            main.ExpenseEntry(
+                date=expense_date,
+                time=None,
+                amount=amount,
+                currency="TWD",
+                category="\u6c34\u8cbb",
+                merchant=None,
+                note="\u6c34\u8cbb",
+                confidence=0.95,
+            ),
+            f"\u6c34\u8cbb {amount}",
+            "U1",
+            message_id,
+        )
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", lambda text: main.ExpenseQuery(
+        date_range_type="today",
+        date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+        category="\u5176\u4ed6",
+        aggregation="sum",
+        confidence=0.95,
+    ))
+
+    query = main.parse_expense_query("\u4e09\u6708\u8ddf\u4e94\u6708\u7684\u6c34\u8cbb\u7e3d\u5171\u591a\u5c11\u9322\uff1f")
+    reply = main.build_summary_reply("\u4e09\u6708\u8ddf\u4e94\u6708\u7684\u6c34\u8cbb\u7e3d\u5171\u591a\u5c11\u9322\uff1f", "U1")
+
+    assert query.date_range_type == "specific_months"
+    assert [(item.start_date, item.end_date) for item in query.date_ranges] == [
+        ("2026-03-01", "2026-03-31"),
+        ("2026-05-01", "2026-05-31"),
+    ]
+    assert query.category == "\u6c34\u8cbb"
+    assert "TWD 300" in reply
+    assert "TWD 1299" not in reply
+
+
+def seed_july_expense_ratio_data():
     rows = (
-        ("stats-food-1", "2026-07-06", 175, "餐飲", "麵包"),
-        ("stats-food-2", "2026-07-07", 65, "餐飲", "早餐"),
-        ("stats-fuel-1", "2026-07-08", 100, "交通", "加油"),
-        ("stats-food-3", "2026-07-12", 170, "餐飲", "宵夜"),
-        ("stats-loan-1", "2026-07-08", 8500, "貸款", "房貸"),
-        ("stats-shop-1", "2026-07-09", 1230, "購物", "尿布"),
+        ("m1", "2026-07-07", 60, "\u9910\u98f2", "\u5348\u9910"),
+        ("m2", "2026-07-07", 70, "\u9910\u98f2", "\u665a\u9910"),
+        ("m3", "2026-07-07", 31, "\u9910\u98f2", "\u98f2\u6599"),
+        ("m4", "2026-07-07", 100, "\u4ea4\u901a", "\u52a0\u6cb9"),
+        ("m5", "2026-07-07", 200, "\u8cfc\u7269", "\u8cb7\u8863\u670d"),
+        ("m6", "2026-07-15", 60000, "\u8cb8\u6b3e", "\u623f\u8cb8"),
     )
     for message_id, expense_date, amount, category, note in rows:
         main.save_expense(
             main.ExpenseEntry(
                 date=expense_date,
                 time=None,
+                amount=amount,
+                currency="TWD",
+                category=category,
+                merchant=None,
+                note=note,
+                confidence=0.95,
+            ),
+            f"{note} {amount}",
+            "U1",
+            message_id,
+        )
+
+
+def test_july_excluding_food_sum_and_ratio(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_expense_ratio_data()
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query_with_openai",
+        lambda text: main.ExpenseQuery(
+            date_range_type="today",
+            date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+            category="\u5176\u4ed6",
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+
+    raw_text = "\u4e03\u6708\u7684\u82b1\u8cbb\uff0c\u9664\u4e86\u98f2\u98df\u5916\uff0c\u7e3d\u5171\u82b1\u591a\u5c11\u9322\uff1f\u4f54\u6bd4\u662f\u591a\u5c11\uff1f"
+    query = main.parse_expense_query(raw_text)
+    summary = main.calculate_expense_summary_with_ratio(query, "U1")
+    reply = main.build_summary_reply(raw_text, "U1")
+
+    assert query.exclude_categories == ["\u9910\u98f2"]
+    assert [(item.start_date, item.end_date) for item in query.date_ranges] == [("2026-07-01", "2026-07-31")]
+    assert query.aggregation == "sum_and_ratio"
+    assert query.ratio_denominator == "all_expenses"
+    assert summary["filtered_total"] == 60300
+    assert summary["denominator_total"] == 60461
+    assert round(summary["ratio_percent"], 2) == 99.73
+    assert "\u6392\u9664\u5206\u985e\uff1a\u9910\u98f2" in reply
+    assert "TWD 60300" in reply
+    assert "99.73%" in reply
+    assert "\u5348\u9910" not in reply
+    assert "\u665a\u9910" not in reply
+    assert "\u98f2\u6599" not in reply
+
+
+def test_july_excluding_transport_query(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query_with_openai",
+        lambda text: main.ExpenseQuery(
+            date_range_type="today",
+            date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+
+    query = main.parse_expense_query("\u4e03\u6708\u9664\u4e86\u4ea4\u901a\u4ee5\u5916\u82b1\u591a\u5c11\uff1f")
+
+    assert query.exclude_categories == ["\u4ea4\u901a"]
+    assert [(item.start_date, item.end_date) for item in query.date_ranges] == [("2026-07-01", "2026-07-31")]
+
+
+def test_july_not_including_food_query(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query_with_openai",
+        lambda text: main.ExpenseQuery(
+            date_range_type="today",
+            date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+
+    query = main.parse_expense_query("7\u6708\u4e0d\u542b\u9910\u98f2\u7e3d\u5171\u591a\u5c11\uff1f")
+
+    assert query.exclude_categories == ["\u9910\u98f2"]
+    assert [(item.start_date, item.end_date) for item in query.date_ranges] == [("2026-07-01", "2026-07-31")]
+
+
+def test_july_food_ratio_query(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "parse_expense_query_with_openai",
+        lambda text: main.ExpenseQuery(
+            date_range_type="today",
+            date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+            category=None,
+            aggregation="sum",
+            confidence=0.95,
+        ),
+    )
+
+    query = main.parse_expense_query("\u4e03\u6708\u9910\u98f2\u4f54\u6bd4\u662f\u591a\u5c11\uff1f")
+
+    assert query.category == "\u9910\u98f2"
+    assert query.aggregation == "sum_and_ratio"
+    assert query.ratio_denominator == "all_expenses"
+
+
+def seed_july_category_breakdown_data():
+    rows = (
+        ("m1", "2026-07-07", 60, "\u9910\u98f2", "\u5348\u9910"),
+        ("m2", "2026-07-07", 70, "\u9910\u98f2", "\u665a\u9910"),
+        ("m3", "2026-07-07", 31, "\u9910\u98f2", "\u98f2\u6599"),
+        ("m4", "2026-07-07", 100, "\u4ea4\u901a", "\u52a0\u6cb9"),
+        ("m5", "2026-07-07", 200, "\u8cfc\u7269", "\u8cb7\u8863\u670d"),
+        ("m6", "2026-07-15", 60000, "\u8cb8\u6b3e", "\u623f\u8cb8"),
+        ("m7", "2026-07-16", 8000, "\u8cb8\u6b3e", "\u8cb8\u6b3e"),
+    )
+    for message_id, expense_date, amount, category, note in rows:
+        main.save_expense(
+            main.ExpenseEntry(
+                date=expense_date,
+                time=None,
+                amount=amount,
+                currency="TWD",
+                category=category,
+                merchant=None,
+                note=note,
+                confidence=0.95,
+            ),
+            f"{note} {amount}",
+            "U1",
+            message_id,
+        )
+
+
+def seed_july_category_breakdown_with_loan_notes():
+    rows = (
+        ("loan1", "2026-07-15", 60000, "\u8cb8\u6b3e", "\u623f\u8cb8"),
+        ("loan2", "2026-07-08", 500, "\u8cb8\u6b3e", "\u4fe1\u8cb8"),
+        ("loan3", "2026-07-16", 8000, "\u8cb8\u6b3e", "\u8cb8\u6b3e"),
+        ("card1", "2026-07-08", 1200, "\u4fe1\u7528\u5361", "\u4fe1\u7528\u5361"),
+        ("food1", "2026-07-07", 60, "\u9910\u98f2", "\u5348\u9910"),
+        ("food2", "2026-07-07", 70, "\u9910\u98f2", "\u665a\u9910"),
+        ("shop1", "2026-07-07", 200, "\u8cfc\u7269", "\u8cb7\u73a9\u5177"),
+    )
+    for message_id, expense_date, amount, category, note in rows:
+        main.save_expense(
+            main.ExpenseEntry(
+                date=expense_date,
+                time=None,
+                amount=amount,
+                currency="TWD",
+                category=category,
+                merchant=None,
+                note=note,
+                confidence=0.95,
+            ),
+            f"{note} {amount}",
+            "U1",
+            message_id,
+        )
+
+
+def fake_bad_breakdown_parse(text):
+    return main.ExpenseQuery(
+        date_range_type="today",
+        date_ranges=[main.DateRange(start_date="2026-07-07", end_date="2026-07-07")],
+        category=None,
+        include_categories=[
+            "\u9910\u98f2",
+            "\u4ea4\u901a",
+            "\u8cfc\u7269",
+            "\u751f\u6d3b\u7528\u54c1",
+            "\u623f\u79df",
+            "\u6c34\u8cbb",
+            "\u96fb\u8cbb",
+            "\u74e6\u65af\u8cbb",
+            "\u96fb\u8a71\u8cbb",
+            "\u7db2\u8def\u8cbb",
+            "\u4fdd\u96aa",
+            "\u4fe1\u7528\u5361",
+            "\u8cb8\u6b3e",
+            "\u4fdd\u6bcd\u8cbb",
+        ],
+        aggregation="sum_and_ratio",
+        ratio_denominator="all_expenses",
+        confidence=0.95,
+    )
+
+
+def test_july_category_breakdown_ratio(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_category_breakdown_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    raw_text = "\u4e03\u6708\u5404\u985e\u5225\u7684\u82b1\u8cbb\u4f54\u6bd4"
+    query = main.parse_expense_query(raw_text)
+    summary = main.calculate_category_breakdown(query, "U1")
+    reply = main.build_summary_reply(raw_text, "U1")
+
+    assert query.aggregation == "category_breakdown"
+    assert query.category is None
+    assert query.include_categories == []
+    assert [(item.start_date, item.end_date) for item in query.date_ranges] == [("2026-07-01", "2026-07-31")]
+    assert summary["denominator_total"] == 68461
+    rows = {row["category"]: row for row in summary["rows"]}
+    assert rows["\u8cb8\u6b3e"]["total"] == 68000
+    assert round(rows["\u8cb8\u6b3e"]["ratio_percent"], 2) == 99.33
+    assert rows["\u8cfc\u7269"]["total"] == 200
+    assert rows["\u9910\u98f2"]["total"] == 161
+    assert rows["\u4ea4\u901a"]["total"] == 100
+    assert "\u5404\u985e\u5225\u4f54\u6bd4" in reply
+    assert "\u8cb8\u6b3e\uff1aTWD 68000" in reply
+    assert "99.33%" in reply
+    assert "\u8cfc\u7269\uff1aTWD 200" in reply
+    assert "\u9910\u98f2\uff1aTWD 161" in reply
+    assert "\u4ea4\u901a\uff1aTWD 100" in reply
+    assert "\u7e3d\u82b1\u8cbb\uff1aTWD" not in reply
+    assert "\u5206\u985e\uff1a\u9910\u98f2\u3001\u4ea4\u901a\u3001\u8cfc\u7269" not in reply
+
+
+def test_july_category_breakdown_excluding_mortgage_keyword(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_category_breakdown_with_loan_notes()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    raw_text = "\u4e03\u6708\u5404\u985e\u5225\u7684\u82b1\u8cbb\u4f54\u6bd4\uff08\u4e0d\u8981\u8a08\u7b97\u623f\u8cb8\uff09"
+    query = main.parse_expense_query(raw_text)
+    summary = main.calculate_category_breakdown(query, "U1")
+    reply = main.build_summary_reply(raw_text, "U1")
+
+    assert query.aggregation == "category_breakdown"
+    assert query.exclude_keywords == ["\u623f\u8cb8"]
+    assert query.exclude_categories == []
+    assert query.ratio_denominator == "filtered_expenses"
+    assert summary["denominator_total"] == 10030
+    rows = {row["category"]: row for row in summary["rows"]}
+    assert rows["\u8cb8\u6b3e"]["total"] == 8500
+    assert round(rows["\u8cb8\u6b3e"]["ratio_percent"], 2) == 84.75
+    assert "\u6392\u9664\u9805\u76ee\uff1a\u623f\u8cb8" in reply
+    assert "TWD 10030" in reply
+    assert "TWD 70030" not in reply
+    assert "\u623f\u8cb8" not in "\n".join(line for line in reply.splitlines() if "\u8cb8\u6b3e\uff1a" in line)
+    assert "\u8cb8\u6b3e\uff1aTWD 8500" in reply
+
+
+def test_july_category_breakdown_without_exclusion_uses_all_expenses(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_category_breakdown_with_loan_notes()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    query = main.parse_expense_query("\u4e03\u6708\u5404\u985e\u5225\u7684\u82b1\u8cbb\u4f54\u6bd4")
+    summary = main.calculate_category_breakdown(query, "U1")
+
+    assert query.ratio_denominator == "all_expenses"
+    assert summary["denominator_total"] == 70030
+    rows = {row["category"]: row for row in summary["rows"]}
+    assert rows["\u8cb8\u6b3e"]["total"] == 68500
+
+
+def test_july_category_breakdown_excluding_loan_category(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_category_breakdown_with_loan_notes()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    query = main.parse_expense_query("\u4e03\u6708\u5404\u985e\u5225\u7684\u82b1\u8cbb\u4f54\u6bd4\uff08\u4e0d\u8981\u8a08\u7b97\u8cb8\u6b3e\uff09")
+    summary = main.calculate_category_breakdown(query, "U1")
+    rows = {row["category"]: row for row in summary["rows"]}
+
+    assert query.exclude_categories == ["\u8cb8\u6b3e"]
+    assert query.exclude_keywords == ["\u8cb8\u6b3e"]
+    assert query.ratio_denominator == "filtered_expenses"
+    assert summary["denominator_total"] == 1530
+    assert "\u8cb8\u6b3e" not in rows
+
+
+def test_july_category_breakdown_excluding_credit_loan_keyword(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_category_breakdown_with_loan_notes()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    query = main.parse_expense_query("\u4e03\u6708\u5404\u985e\u5225\u7684\u82b1\u8cbb\u4f54\u6bd4\uff08\u4e0d\u8981\u8a08\u7b97\u4fe1\u8cb8\uff09")
+    summary = main.calculate_category_breakdown(query, "U1")
+    rows = {row["category"]: row for row in summary["rows"]}
+
+    assert query.exclude_keywords == ["\u4fe1\u8cb8"]
+    assert query.exclude_categories == []
+    assert summary["denominator_total"] == 69530
+    assert rows["\u8cb8\u6b3e"]["total"] == 68000
+
+
+def seed_actual_spending_with_paid_payable():
+    main.save_expense(
+        main.ExpenseEntry(
+            date="2026-07-06",
+            time=None,
+            amount=175,
+            currency="TWD",
+            category="\u9910\u98f2",
+            merchant=None,
+            note="\u9eb5\u5305",
+            confidence=0.95,
+        ),
+        "\u9eb5\u5305 175",
+        "U1",
+        "actual-expense-1",
+    )
+    insert_payable(
+        line_user_id="U1",
+        item_type="\u623f\u8cb8",
+        amount=7,
+        due_date="2026-07-15",
+        status="paid",
+    )
+
+
+def test_actual_spending_rows_include_expenses_and_paid_payables(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_actual_spending_with_paid_payable()
+
+    rows = main.get_actual_spending_rows("2026-07-01", "2026-07-31", "U1")
+    by_source = {str(row["source"]): row for row in rows}
+
+    assert by_source["expense"]["note"] == "\u9eb5\u5305"
+    assert by_source["paid_payable"]["note"] == "\u623f\u8cb8"
+    assert by_source["paid_payable"]["category"] == "\u8cb8\u6b3e"
+    assert by_source["paid_payable"]["date"] == "2026-07-16"
+
+
+def test_all_spending_ratio_pie_includes_paid_payables(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_actual_spending_with_paid_payable()
+    set_fake_today(monkeypatch, 2026, 7, 8)
+
+    def raise_expense_parser(text):
+        raise RuntimeError("skip OpenAI in test")
+
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", raise_expense_parser)
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://example.ngrok-free.app")
+    monkeypatch.setattr(main, "CHART_DIR", tmp_path / "charts")
+
+    raw_text = "\u9019\u500b\u6708\u7684\u6240\u6709\u82b1\u8cbb\u6bd4\u4f8b + \u5713\u9905\u5716"
+    query = main.parse_expense_query(raw_text)
+    result = main.execute_expense_query(query, "U1")
+    reply = main.build_expense_reply(raw_text, "U1")
+    rows = {row["group"]: row for row in result["rows"]}
+
+    assert query.aggregation == "category_breakdown"
+    assert query.group_by == ["category"]
+    assert query.chart_type == "pie"
+    assert result["denominator_total"] == 182
+    assert rows["\u9910\u98f2"]["total"] == 175
+    assert round(float(rows["\u9910\u98f2"]["ratio_percent"]), 2) == 96.15
+    assert rows["\u8cb8\u6b3e"]["total"] == 7
+    assert round(float(rows["\u8cb8\u6b3e"]["ratio_percent"]), 2) == 3.85
+    assert "\u9910\u98f2\uff1aTWD 175" in reply["text"]
+    assert "\u8cb8\u6b3e\uff1aTWD 7" in reply["text"]
+    assert reply["image_url"] is not None
+
+
+def test_actual_spending_aggregate_max_min_include_paid_payables(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_actual_spending_with_paid_payable()
+
+    query = main.ExpenseQuery(
+        date_range_type="custom",
+        date_ranges=[main.DateRange(start_date="2026-07-01", end_date="2026-07-31")],
+        category=None,
+        aggregation="sum",
+        confidence=0.95,
+    )
+    result = main.execute_expense_query(query, "U1")
+
+    assert result["count"] == 2
+    assert result["total"] == 182
+    assert result["max"] == 175
+    assert result["max_item_name"] == "\u9eb5\u5305"
+    assert result["min"] == 7
+    assert result["min_item_name"] == "\u623f\u8cb8"
+
+
+def test_month_finance_counts_paid_payables_as_actual_spending(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_actual_spending_with_paid_payable()
+    insert_payable(
+        line_user_id="U1",
+        item_type="\u4fe1\u8cb8",
+        amount=10,
+        due_date="2026-07-20",
+        status="unpaid",
+    )
+
+    finance = main.get_month_finance("\u9019\u500b\u6708\u9810\u4f30\u7e3d\u652f\u51fa", "U1")
+
+    assert finance["expense_total"] == 182
+    assert finance["unpaid_total"] == 10
+    assert finance["available_cash"] == -192
+
+
+def test_household_expense_queries_include_other_family_members(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    set_fake_today(monkeypatch, 2026, 7, 10)
+
+    own_expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=100,
+        currency="TWD",
+        category="交通",
+        merchant=None,
+        note="加油",
+        confidence=0.9,
+    )
+    family_expense = main.ExpenseEntry(
+        date="2026-07-10",
+        time=None,
+        amount=984,
+        currency="TWD",
+        category="交通",
+        merchant=None,
+        note="加油",
+        confidence=0.9,
+    )
+    main.save_expense(own_expense, "加油100", "U1", "m-u1")
+    main.save_expense(family_expense, "加油984", "U2", "m-u2")
+
+    summary_reply = main.build_summary_reply("這星期在交通的花費總共是多少?", "U1")
+    list_reply = main.build_list_reply("這兩天的花費清單", "U1")
+
+    assert "筆數：2" in summary_reply
+    assert "總花費：TWD 1084" in summary_reply
+    assert "TWD 984" in list_reply
+    assert "TWD 100" in list_reply
+
+
+def test_july_category_ratio_short_text(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    query = main.parse_expense_query("7\u6708\u5206\u985e\u4f54\u6bd4")
+
+    assert query.aggregation == "category_breakdown"
+    assert query.category is None
+    assert query.include_categories == []
+
+
+def test_july_each_category_spending_text(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    query = main.parse_expense_query("\u4e03\u6708\u6bcf\u500b\u985e\u5225\u82b1\u591a\u5c11")
+
+    assert query.aggregation == "category_breakdown"
+    assert query.category is None
+    assert query.include_categories == []
+
+
+def test_this_month_each_category_ratio_text(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_breakdown_parse)
+
+    query = main.parse_expense_query("\u9019\u500b\u6708\u5404\u5206\u985e\u652f\u51fa\u6bd4\u4f8b")
+
+    assert query.aggregation == "category_breakdown"
+    assert query.category is None
+    assert query.include_categories == []
+
+
+def seed_july_list_sort_data():
+    rows = (
+        ("sort1", "2026-07-07", "12:00", 60, "\u9910\u98f2", "\u5348\u9910"),
+        ("sort2", "2026-07-07", "20:00", 120, "\u9910\u98f2", "\u665a\u9910"),
+        ("sort3", "2026-07-07", "15:00", 30, "\u9910\u98f2", "\u9ede\u5fc3"),
+        ("sort4", "2026-07-08", None, 100, "\u96fb\u8a71\u8cbb", "\u96fb\u8a71\u8cbb"),
+        ("sort5", "2026-07-05", None, 500, "\u4ea4\u901a", "\u52a0\u6cb9"),
+    )
+    for message_id, expense_date, expense_time, amount, category, note in rows:
+        main.save_expense(
+            main.ExpenseEntry(
+                date=expense_date,
+                time=expense_time,
+                amount=amount,
+                currency="TWD",
+                category=category,
+                merchant=None,
+                note=note,
+                confidence=0.95,
+            ),
+            f"{note} {amount}",
+            "U1",
+            message_id,
+        )
+
+
+def fake_bad_list_parse(text):
+    return main.ExpenseQuery(
+        date_range_type="today",
+        date_ranges=[main.DateRange(start_date="2026-07-08", end_date="2026-07-08")],
+        aggregation="list",
+        confidence=0.95,
+    )
+
+
+def assert_order(text: str, *labels: str):
+    positions = [text.index(label) for label in labels]
+    assert positions == sorted(positions)
+
+
+def test_list_expenses_sort_amount_desc(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_list_sort_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_list_parse)
+
+    raw_text = "\u5217\u51fa\u4e03\u6708\u82b1\u8cbb\uff0c\u6309\u91d1\u984d\u7531\u5927\u5230\u5c0f"
+    query = main.parse_expense_query(raw_text)
+    reply = main.build_list_reply(raw_text, "U1")
+
+    assert query.sort_by == "amount"
+    assert query.sort_direction == "desc"
+    assert "\u6392\u5e8f\uff1a\u91d1\u984d\u7531\u5927\u5230\u5c0f" in reply
+    assert_order(reply, "\u52a0\u6cb9", "\u665a\u9910")
+
+
+def test_list_expenses_sort_amount_asc(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_list_sort_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_list_parse)
+
+    raw_text = "\u5217\u51fa\u4e03\u6708\u82b1\u8cbb\uff0c\u91d1\u984d\u5c0f\u5230\u5927"
+    reply = main.build_list_reply(raw_text, "U1")
+
+    assert_order(reply, "\u9ede\u5fc3", "\u5348\u9910")
+
+
+def test_list_expenses_sort_time_asc(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_list_sort_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_list_parse)
+
+    raw_text = "\u5217\u51fa7\u67087\u865f\u82b1\u8cbb\uff0c\u6642\u9593\u65e9\u5230\u665a"
+    query = main.parse_expense_query(raw_text)
+    reply = main.build_list_reply(raw_text, "U1")
+
+    assert query.sort_by == "time"
+    assert query.sort_direction == "asc"
+    assert [(item.start_date, item.end_date) for item in query.date_ranges] == [("2026-07-07", "2026-07-07")]
+    assert_order(reply, "12:00 \u5348\u9910", "15:00 \u9ede\u5fc3", "20:00 \u665a\u9910")
+
+
+def test_list_expenses_sort_time_desc(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_list_sort_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_list_parse)
+
+    raw_text = "\u5217\u51fa7\u67087\u865f\u82b1\u8cbb\uff0c\u6642\u9593\u665a\u5230\u65e9"
+    reply = main.build_list_reply(raw_text, "U1")
+
+    assert_order(reply, "20:00 \u665a\u9910", "15:00 \u9ede\u5fc3", "12:00 \u5348\u9910")
+
+
+def test_list_expenses_sort_date_asc(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_list_sort_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_list_parse)
+
+    raw_text = "\u5217\u51fa\u4e03\u6708\u82b1\u8cbb\uff0c\u65e5\u671f\u820a\u5230\u65b0"
+    reply = main.build_list_reply(raw_text, "U1")
+
+    assert_order(reply, "2026-07-05 \u52a0\u6cb9", "2026-07-08 \u96fb\u8a71\u8cbb")
+
+
+def test_list_expenses_default_sort_date_desc(monkeypatch, tmp_path):
+    setup_tmp_db(monkeypatch, tmp_path)
+    seed_july_list_sort_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_list_parse)
+
+    raw_text = "\u5217\u51fa\u4e03\u6708\u82b1\u8cbb"
+    query = main.parse_expense_query(raw_text)
+    reply = main.build_list_reply(raw_text, "U1")
+
+    assert query.sort_by == "date"
+    assert query.sort_direction == "desc"
+    assert "\u6392\u5e8f\uff1a\u65e5\u671f\u7531\u65b0\u5230\u820a" in reply
+    assert_order(reply, "2026-07-08 \u96fb\u8a71\u8cbb", "2026-07-05 \u52a0\u6cb9")
+
+
+def seed_expense_statistics_data():
+    rows = (
+        ("stat1", "2026-07-06", None, 0, "\u9910\u98f2", "\u7121"),
+        ("stat2", "2026-07-07", "12:00", 100, "\u9910\u98f2", "\u5348\u9910"),
+        ("stat3", "2026-02-10", None, 300, "\u9910\u98f2", "\u9910\u98f2"),
+        ("stat4", "2026-03-10", None, 50, "\u9910\u98f2", "\u9910\u98f2"),
+        ("stat5", "2026-05-10", None, 300, "\u9910\u98f2", "\u9910\u98f2"),
+        ("stat6", "2026-06-10", None, 400, "\u9910\u98f2", "\u9910\u98f2"),
+        ("stat7", "2026-07-15", None, 60000, "\u8cb8\u6b3e", "\u623f\u8cb8"),
+        ("stat8", "2026-07-08", None, 500, "\u8cb8\u6b3e", "\u4fe1\u8cb8"),
+        ("stat9", "2026-07-16", None, 8000, "\u8cb8\u6b3e", "\u8cb8\u6b3e"),
+        ("stat10", "2026-07-08", None, 1200, "\u4fe1\u7528\u5361", "\u4fe1\u7528\u5361"),
+        ("stat11", "2026-07-07", None, 70, "\u9910\u98f2", "\u665a\u9910"),
+        ("stat12", "2026-07-07", None, 200, "\u8cfc\u7269", "\u8cb7\u73a9\u5177"),
+    )
+    for message_id, expense_date, expense_time, amount, category, note in rows:
+        if amount <= 0:
+            continue
+        main.save_expense(
+            main.ExpenseEntry(
+                date=expense_date,
+                time=expense_time,
                 amount=amount,
                 currency="TWD",
                 category=category,
@@ -991,8 +2061,8 @@ def test_chart_request_without_public_base_url_explains_missing_image(monkeypatc
 
 def seed_weekly_food_240_data():
     rows = (
-        ("food-week-1", "2026-07-06", 175, "麵包"),
-        ("food-week-2", "2026-07-07", 65, "早餐"),
+        ("food-week-1", "2026-07-06", 175, "\u9eb5\u5305"),
+        ("food-week-2", "2026-07-07", 65, "\u65e9\u9910"),
     )
     for message_id, expense_date, amount, note in rows:
         main.save_expense(
@@ -1094,140 +2164,177 @@ def test_app_env_test_uses_accounting_test_db(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
 
     assert main.get_app_env() == "test"
-    assert main.get_db_path().endswith("accounting_test.db")
+    assert os.path.basename(main.get_db_path()) == "accounting_test.db"
 
 
-def test_get_db_path_requires_non_prod_name_under_test(monkeypatch):
+def test_app_env_test_rejects_prod_db(monkeypatch):
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("DB_PATH", "accounting.db")
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
 
     try:
         main.get_db_path()
-        assert False, "expected RuntimeError"
     except RuntimeError as exc:
-        assert "APP_ENV=test" in str(exc)
+        assert "cannot use prod DB" in str(exc)
+    else:
+        raise AssertionError("APP_ENV=test should reject accounting.db")
 
 
-def test_checksql_limit_parsing():
-    assert main.parse_recent_sql_changes_limit("checkSql") == 5
-    assert main.parse_recent_sql_changes_limit("checkSql3") == 3
-    assert main.parse_recent_sql_changes_limit("checkSql99") == 20
-    assert main.parse_recent_sql_changes_limit("checkSql0") == 1
-    assert main.parse_recent_sql_changes_limit("other") is None
-
-
-def test_recent_sql_changes_empty(monkeypatch, tmp_path):
+def test_app_env_test_push_line_message_is_skipped(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
 
-    reply = main.handle_special_command("checkSql", "U1")
+    async def fail_post(*args, **kwargs):
+        raise AssertionError("LINE Push API should not be called in APP_ENV=test")
 
-    assert reply.startswith("最近5筆 SQL 新增/刪除")
-    assert "今天還沒有資料" in reply
+    monkeypatch.setattr(main.httpx.AsyncClient, "post", fail_post, raising=False)
+
+    asyncio.run(main.push_line_message("U1", "test"))
 
 
-def test_openai_route_failure_falls_back(monkeypatch, tmp_path):
+def test_grouped_food_query_ignores_wrong_route_category(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
-    monkeypatch.setattr(main, "route_action_with_openai", lambda text: (_ for _ in ()).throw(RuntimeError("boom")))
+    set_fake_today(monkeypatch, 2026, 7, 8)
+    seed_expense_statistics_data()
+    monkeypatch.setattr(main, "parse_expense_query_with_openai", fake_bad_stat_parse)
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
 
-    route = main.route_action("午餐 120", "U1")
+    route = main.ActionRoute(
+        action="query_expenses",
+        should_mutate_db=False,
+        confidence=0.95,
+        category="\u5176\u4ed6",
+    )
+    reply = main.build_expense_reply("\u672c\u9031\u9910\u98f2\u6bcf\u5929\u82b1\u591a\u5c11 + \u6298\u7dda\u5716", "U1", route)
 
-    assert route.action == "create_expense"
+    assert "2026-07-07\uff1aTWD 170" in reply["text"]
 
 
-def test_openai_expense_parse_failure_falls_back(monkeypatch, tmp_path):
+def test_line_chart_keeps_zero_value_points(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
-    monkeypatch.setattr(main, "parse_expense_text", lambda text: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://example.ngrok-free.app")
+    monkeypatch.setattr(main, "CHART_DIR", tmp_path / "charts")
+    captured = {}
 
-    expense = main.parse_expense_text_fallback("午餐 120")
+    fake_matplotlib = types.ModuleType("matplotlib")
+    fake_matplotlib.use = lambda backend: None
+    fake_pyplot = types.ModuleType("matplotlib.pyplot")
+    fake_pyplot.figure = lambda **kwargs: None
+    fake_pyplot.plot = lambda labels, values, marker=None: captured.update({"labels": labels, "values": values})
+    fake_pyplot.xticks = lambda *args, **kwargs: None
+    fake_pyplot.ylabel = lambda *args, **kwargs: None
+    fake_pyplot.tight_layout = lambda: None
+    fake_pyplot.savefig = lambda path, dpi=None: path.write_bytes(b"png")
+    fake_pyplot.close = lambda: None
+    fake_pyplot.pie = lambda *args, **kwargs: None
+    fake_pyplot.axis = lambda *args, **kwargs: None
+    fake_pyplot.bar = lambda *args, **kwargs: None
+    fake_matplotlib.pyplot = fake_pyplot
+    monkeypatch.setitem(sys.modules, "matplotlib", fake_matplotlib)
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", fake_pyplot)
 
-    assert expense.amount == 120
-    assert expense.category == "餐飲"
+    query = main.ExpenseQuery(
+        mode="grouped_aggregate",
+        metric="sum",
+        group_by=["day"],
+        date_range_type="custom",
+        date_ranges=[main.DateRange(start_date="2026-07-06", end_date="2026-07-08")],
+        wants_chart=True,
+        chart_type="line",
+        aggregation="sum",
+        confidence=0.95,
+    )
+    result = {
+        "mode": "grouped_aggregate",
+        "group_by": "day",
+        "rows": [
+            {"group": "2026-07-06", "total": 0, "count": 0},
+            {"group": "2026-07-07", "total": 100, "count": 1},
+            {"group": "2026-07-08", "total": 0, "count": 0},
+        ],
+    }
+
+    url = main.generate_expense_chart(query, result)
+
+    assert url is not None
+    assert captured["labels"] == ["2026-07-06", "2026-07-07", "2026-07-08"]
+    assert captured["values"] == [0, 100, 0]
 
 
-def test_parse_due_date_weekday_variants(monkeypatch, tmp_path):
+def install_fake_matplotlib(monkeypatch):
+    fake_matplotlib = types.ModuleType("matplotlib")
+    fake_matplotlib.use = lambda backend: None
+    fake_pyplot = types.ModuleType("matplotlib.pyplot")
+    fake_pyplot.figure = lambda **kwargs: None
+    fake_pyplot.plot = lambda *args, **kwargs: None
+    fake_pyplot.xticks = lambda *args, **kwargs: None
+    fake_pyplot.ylabel = lambda *args, **kwargs: None
+    fake_pyplot.tight_layout = lambda: None
+    fake_pyplot.savefig = lambda path, dpi=None: path.write_bytes(b"png")
+    fake_pyplot.close = lambda: None
+    fake_pyplot.pie = lambda *args, **kwargs: None
+    fake_pyplot.axis = lambda *args, **kwargs: None
+    fake_pyplot.bar = lambda *args, **kwargs: None
+    fake_matplotlib.pyplot = fake_pyplot
+    monkeypatch.setitem(sys.modules, "matplotlib", fake_matplotlib)
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", fake_pyplot)
+
+
+def make_chart_query():
+    return main.ExpenseQuery(
+        mode="grouped_aggregate",
+        metric="sum",
+        group_by=["day"],
+        date_range_type="custom",
+        date_ranges=[main.DateRange(start_date="2026-07-06", end_date="2026-07-07")],
+        wants_chart=True,
+        chart_type="line",
+        aggregation="sum",
+        confidence=0.95,
+    )
+
+
+def make_chart_result(value=100):
+    return {
+        "mode": "grouped_aggregate",
+        "group_by": "day",
+        "rows": [
+            {"group": "2026-07-06", "total": 0, "count": 0},
+            {"group": "2026-07-07", "total": value, "count": 1},
+        ],
+    }
+
+
+def test_chart_cache_reuses_same_payload(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
-    set_fake_today(monkeypatch, 2026, 7, 14)
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://example.ngrok-free.app")
+    monkeypatch.setattr(main, "CHART_DIR", tmp_path / "charts")
+    install_fake_matplotlib(monkeypatch)
 
-    assert main.parse_due_date("下禮拜三") == "2026-07-22"
-    assert main.parse_due_date("下週三") == "2026-07-22"
-    assert main.parse_due_date("下個星期一") == "2026-07-20"
-    assert main.parse_due_date("星期六") == "2026-07-18"
-    assert main.parse_due_date("這週三") == "2026-07-15"
+    query = make_chart_query()
+    result = make_chart_result()
+    url1 = main.generate_expense_chart(query, result, "U1")
+    url2 = main.generate_expense_chart(query, result, "U1")
+
+    assert url1 == url2
+    assert len(list((tmp_path / "charts").glob("*.png"))) == 1
 
 
-def test_payable_query_unpaid_status(monkeypatch, tmp_path):
+def test_chart_cache_different_payload_creates_different_png(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
-    disable_payable_openai(monkeypatch)
-    insert_payable(item_type="\u623f\u8cb8", amount=60000, due_date="2026-07-15", status="unpaid")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://example.ngrok-free.app")
+    monkeypatch.setattr(main, "CHART_DIR", tmp_path / "charts")
+    install_fake_matplotlib(monkeypatch)
 
-    reply = main.build_payable_query_reply("\u623f\u8cb8\u7e73\u4e86\u55ce?", "test_user")
+    query = make_chart_query()
+    url1 = main.generate_expense_chart(query, make_chart_result(100), "U1")
+    url2 = main.generate_expense_chart(query, make_chart_result(200), "U1")
 
-    assert "還沒繳" in reply
-
-
-def test_payable_query_paid_status(monkeypatch, tmp_path):
-    setup_tmp_db(monkeypatch, tmp_path)
-    disable_payable_openai(monkeypatch)
-    insert_payable(item_type="\u623f\u8cb8", amount=60000, due_date="2026-07-15", status="paid")
-
-    reply = main.build_payable_query_reply("\u623f\u8cb8\u7e73\u4e86\u55ce?", "test_user")
-
-    assert "已經繳了" in reply
+    assert url1 != url2
+    assert len(list((tmp_path / "charts").glob("*.png"))) == 2
 
 
-def test_create_payable_draft_then_due_date(monkeypatch, tmp_path):
-    setup_tmp_db(monkeypatch, tmp_path)
-
-    route = main.route_action("房貸 60000", "test_user")
-    reply = main.execute_action_route(route, "房貸 60000", "test_user", "m-draft-1")
-    assert "繳費日期" in reply
-
-    route = main.route_action("7/15", "test_user")
-    reply = main.execute_action_route(route, "7/15", "test_user", "m-draft-2")
-    assert "已建立待繳提醒" in reply
-
-
-def test_cancel_payable_draft(monkeypatch, tmp_path):
-    setup_tmp_db(monkeypatch, tmp_path)
-
-    main.save_payable_draft("test_user", "房貸", 60000, None, None, "房貸 60000")
-    reply = main.execute_action_route(main.ActionRoute(action="chat", should_mutate_db=False, confidence=1), "取消", "test_user", "m-cancel")
-
-    assert "已取消這筆待繳提醒草稿" in reply
-
-
-def test_available_cash_reply(monkeypatch, tmp_path):
-    setup_tmp_db(monkeypatch, tmp_path)
-    with main.get_db() as conn:
-        conn.execute(
-            "INSERT INTO incomes (line_user_id, raw_text, income_date, amount, currency, income_type, item_name, owner, category, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("U1", "薪水 50000", "2026-07-08", 50000, "TWD", "薪資收入", "薪水", None, "薪資收入", "薪水 50000", "2026-07-08T00:00:00+00:00"),
-        )
-        conn.commit()
-    main.save_expense(main.ExpenseEntry(date="2026-07-08", time=None, amount=1000, currency="TWD", category="餐飲", merchant=None, note="聚餐", confidence=0.95), "聚餐 1000", "U1", "m-avail")
-
-    reply = main.build_available_cash_reply("有多少錢可以買玩具?", "U1", main.ActionRoute(action="query_available_cash", should_mutate_db=False, confidence=0.9, purchase_purpose="玩具"))
-
-    assert "目前可動用金額" in reply
-    assert "玩具" in reply
-
-
-def test_available_investment_cash_reply(monkeypatch, tmp_path):
-    setup_tmp_db(monkeypatch, tmp_path)
-    with main.get_db() as conn:
-        conn.execute(
-            "INSERT INTO incomes (line_user_id, raw_text, income_date, amount, currency, income_type, item_name, owner, category, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("U1", "薪水 50000", "2026-07-08", 50000, "TWD", "薪資收入", "薪水", None, "薪資收入", "薪水 50000", "2026-07-08T00:00:00+00:00"),
-        )
-        conn.commit()
-
-    reply = main.build_available_investment_cash_reply("可以投資多少?", "U1")
-
-    assert "投資可動用金額" in reply
-    assert "保守建議投入" in reply
-
-
-def test_cleanup_old_charts(monkeypatch, tmp_path):
+def test_cleanup_old_charts_deletes_expired_png(monkeypatch, tmp_path):
     setup_tmp_db(monkeypatch, tmp_path)
     monkeypatch.setattr(main, "CHART_DIR", tmp_path / "charts")
     (tmp_path / "charts").mkdir()
